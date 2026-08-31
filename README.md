@@ -6,6 +6,7 @@ App web local para cargar la Google Sheet de pallets, agrupar por `Nro Pallet` o
 
 - `supervisor` / `validacion`
 - `validador` / `1234`
+- `CD_Oslo` / `Oslo.2027` acceso invitado solo a `Supervisor > Reporte`
 
 ## Flujo principal
 
@@ -18,7 +19,7 @@ App web local para cargar la Google Sheet de pallets, agrupar por `Nro Pallet` o
 
 ## Supervisor
 
-Al ingresar como supervisor aparece una pantalla para escoger entre `Data` y `Reporte`, similar al selector de vista del validador. `Data` sirve para revisar, regularizar, eliminar y exportar incidencias. `Reporte` tiene los submodulos `Resumen` y `Avance`: `Resumen` muestra indicadores, tendencias por hora o por fecha, bultos por turno, regularizadas vs total y ranking de impacto; `Avance` compara incidencias totales contra regularizadas por dia, semana o mes, con filtros por tienda y estado. La data del supervisor se refresca automaticamente cada 3 segundos mientras la sesion esta abierta.
+Al ingresar como supervisor aparece una pantalla para escoger entre `Data` y `Reporte`, similar al selector de vista del validador. `Data` sirve para revisar, regularizar, eliminar y exportar incidencias. `Reporte` tiene los submodulos `Resumen` y `Avance`: `Resumen` muestra indicadores, tendencias por hora o por fecha, bultos por turno, regularizadas vs total y ranking de impacto; `Avance` compara incidencias totales contra regularizadas por dia, semana o mes, con filtros por tienda y estado. La data del supervisor se refresca automaticamente cada 3 segundos mientras la sesion esta abierta. El usuario invitado entra directo a `Reporte` y no puede acceder a `Data`, cambiar estados ni eliminar incidencias.
 
 ## Envio de incidencias a Google Sheets
 
@@ -28,6 +29,6 @@ El reporte esta configurado para guardarse en:
 
 Endpoint configurado:
 
-`https://script.google.com/macros/s/AKfycbzBMQ_ZLWPnx6GgjKvBHbR73nHkQ0q7aA8qIRWcxjhNQTdfH771iz_ifHi2Me-O-dgh/exec`
+`https://script.google.com/macros/s/AKfycbzLQH1ygQ1tcjPh_APc8k9hmMwnVdd-URHXaAw7FdpUXuu-tYI3zoft0JLpZ4-8vWqP/exec`
 
 El supervisor cambia el estado a `Pendiente` o `Regularizado` desde su pagina de reporte. Al crear la incidencia, el Google Sheet guarda `fecha_incidente`. Al regularizar, guarda `fecha_regularizado`. El reporte de supervisor lee solo lo guardado en Google Sheet y permite exportar Excel con las columnas: tienda, pallet, lpn, codigos, descripcion, bultos, estado, fecha_incidente y fecha_regularizado.

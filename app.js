@@ -21,6 +21,7 @@ const VALIDATION_VERSION = "bultos-v4";
 const USERS = [
   { user: "supervisor", pass: "validacion", role: "Supervisor" },
   { user: "validador", pass: "1234", role: "Validador" },
+  { user: "CD_Oslo", pass: "Oslo.2027", role: "Invitado" },
 ];
 
 const state = {
@@ -55,6 +56,14 @@ const state = {
 const app = document.querySelector("#app");
 let reportRefreshTimer = null;
 let queryRenderTimer = null;
+
+function canViewSupervisorReport() {
+  return state.user?.role === "Supervisor" || state.user?.role === "Invitado";
+}
+
+function canManageIncidents() {
+  return state.user?.role === "Supervisor";
+}
 
 function loadJson(key, fallback) {
   try {
@@ -341,15 +350,16 @@ async function loadReportIncidents(options = {}) {
     });
     return;
   } catch (error) {
+    if (silent) return;
     state.reportStatus = "error";
-    state.reportError = "El envio de incidencias esta configurado, pero falta publicar la ultima version del Apps Script para leer el reporte y cambiar estados.";
-    if (!silent) toast("Falta actualizar la implementacion del Apps Script.");
+    state.reportError = "No se pudo refrescar el reporte en este momento. La app sigue funcionando; intenta actualizar nuevamente.";
+    toast("No se pudo refrescar el reporte.");
   }
   render();
 }
 
 function startReportAutoRefresh() {
-  if (reportRefreshTimer || state.user?.role !== "Supervisor") return;
+  if (reportRefreshTimer || !canViewSupervisorReport()) return;
   reportRefreshTimer = window.setInterval(() => loadReportIncidents({ silent: true }), REPORT_REFRESH_MS);
 }
 
@@ -506,9 +516,13 @@ function login(event) {
     return;
   }
   state.user = { user: found.user, role: found.role, at: new Date().toISOString() };
+  if (found.role === "Invitado") {
+    state.supervisorView = "report";
+    state.reportModule = "summary";
+  }
   saveJson(STORAGE_KEYS.session, state.user);
   render();
-  if (state.user.role === "Supervisor") {
+  if (canViewSupervisorReport()) {
     if (state.supervisorView) loadReportIncidents();
   } else if (state.validatorView) {
     loadData();
@@ -543,6 +557,7 @@ function chooseSupervisorView(view) {
 }
 
 function changeSupervisorView() {
+  if (!canManageIncidents()) return;
   state.supervisorView = "";
   localStorage.removeItem(STORAGE_KEYS.supervisorView);
   render();
@@ -936,7 +951,7 @@ function renderLogin() {
         <div class="form-row">
           <button class="btn primary" type="submit">Ingresar</button>
         </div>
-        <p class="notice">Usuarios iniciales: supervisor / validacion, validador / 1234.</p>
+        
       </form>
     </section>
   `;
@@ -944,7 +959,7 @@ function renderLogin() {
 }
 
 function renderApp() {
-  if (state.user.role === "Supervisor") {
+  if (canViewSupervisorReport()) {
     startReportAutoRefresh();
     renderSupervisorApp();
     return;
@@ -1019,6 +1034,9 @@ function renderApp() {
 }
 
 function renderSupervisorApp() {
+  if (state.user.role === "Invitado") {
+    state.supervisorView = "report";
+  }
   if (!state.supervisorView) {
     renderSupervisorViewPicker();
     return;
@@ -1035,12 +1053,12 @@ function renderSupervisorApp() {
           </div>
         </div>
         <div class="topbar-actions">
-          <button class="btn ghost" id="changeSupervisorViewBtn">Cambiar vista</button>
+          ${canManageIncidents() ? `<button class="btn ghost" id="changeSupervisorViewBtn">Cambiar vista</button>` : ""}
           <button class="btn ghost" id="logoutBtn">Salir</button>
         </div>
       </header>
       <div class="layout">
-        ${state.supervisorView === "report" ? renderDashboard() : renderHistory()}
+        ${state.supervisorView === "report" || state.user.role === "Invitado" ? renderDashboard() : renderHistory()}
       </div>
     </section>
   `;
@@ -1820,8 +1838,8 @@ function renderHistory() {
           <p class="muted">Muestra solo incidencias guardadas en Google Sheet.</p>
         </div>
         <div class="quick-actions">
-          ${state.user.role === "Supervisor" ? `<button class="btn danger" id="deleteSelectedBtn">Eliminar seleccionadas</button>` : ""}
-          ${state.user.role === "Supervisor" ? `<button class="btn ghost" id="refreshReportBtn">Actualizar reporte</button>` : ""}
+          ${canManageIncidents() ? `<button class="btn danger" id="deleteSelectedBtn">Eliminar seleccionadas</button>` : ""}
+          ${canManageIncidents() ? `<button class="btn ghost" id="refreshReportBtn">Actualizar reporte</button>` : ""}
           <button class="btn warning" id="historyExportBtn">Exportar Excel</button>
         </div>
       </div>
@@ -1839,7 +1857,7 @@ function renderHistory() {
                 return `
                 <article class="incident">
                   ${
-                    state.user.role === "Supervisor" && normalized.id
+                    canManageIncidents() && normalized.id
                       ? `<label class="incident-check" title="Seleccionar incidencia">
                           <input type="checkbox" data-incident-select="${escapeAttr(normalized.id)}" ${state.selectedIncidentIds.has(String(normalized.id)) ? "checked" : ""} />
                         </label>`
@@ -1855,7 +1873,7 @@ function renderHistory() {
                     <span class="badge missing">${escapeHtml(normalized.bultos || "0.00")} bultos falt.</span>
                     ${normalized.precio ? `<span class="badge">S/ ${money(normalized.precio)}</span>` : ""}
                     ${
-                      state.user.role === "Supervisor" && normalized.id
+                      canManageIncidents() && normalized.id
                         ? `<select class="status-select" data-status-id="${escapeAttr(normalized.id)}">
                             <option value="Pendiente" ${normalized.estado === "Pendiente" ? "selected" : ""}>Pendiente</option>
                             <option value="Regularizado" ${normalized.estado === "Regularizado" ? "selected" : ""}>Regularizado</option>
@@ -1991,11 +2009,14 @@ function render() {
     renderLogin();
     return;
   }
+  if (state.user.role === "Invitado") {
+    state.supervisorView = "report";
+  }
   if (state.user.role === "Supervisor" && !state.supervisorView) {
     renderSupervisorViewPicker();
     return;
   }
-  if (state.user.role !== "Supervisor" && !state.validatorView) {
+  if (!canViewSupervisorReport() && !state.validatorView) {
     renderValidatorViewPicker();
     return;
   }
@@ -2005,7 +2026,8 @@ function render() {
 }
 
 render();
-if (state.user?.role === "Supervisor") {
+if (canViewSupervisorReport()) {
+  if (state.user.role === "Invitado") state.supervisorView = "report";
   if (state.supervisorView) {
     startReportAutoRefresh();
     loadReportIncidents();
@@ -2015,7 +2037,7 @@ if (state.user?.role === "Supervisor") {
 }
 
 window.addEventListener("storage", (event) => {
-  if (state.user?.role !== "Supervisor") return;
+  if (!canViewSupervisorReport()) return;
   if (event.key === STORAGE_KEYS.reportPing) {
     loadReportIncidents({ silent: true });
   }
