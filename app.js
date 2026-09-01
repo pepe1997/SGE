@@ -3,9 +3,11 @@ const GVIZ_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq`;
 const SHEETS = {
   cartons: "CARTONES",
   products: "PRODUCTOS",
+  sent: "ENVIADO",
+  cargo: "CARGA",
 };
 const REPORT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1EBG_HWQ3lp4UWjPtpMgc0UMe_mH53RWtgAtnDMCQ_nc/edit";
-const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbzLQH1ygQ1tcjPh_APc8k9hmMwnVdd-URHXaAw7FdpUXuu-tYI3zoft0JLpZ4-8vWqP/exec";
+const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbzaflhCFckAHpTg34s4FVXpZHsrRzIV8cFrZOV0nZo01kQB5nYDViyfk6l0armcPjm2/exec";
 const REPORT_REFRESH_MS = 3000;
 const STORAGE_KEYS = {
   session: "palletValidator.session",
@@ -37,16 +39,33 @@ const state = {
   groupCache: [],
   status: "idle",
   reportStatus: "idle",
+  sentStatus: "idle",
+  cargoStatus: "idle",
   error: "",
   reportError: "",
+  sentError: "",
+  cargoError: "",
   incidents: [],
+  sentRows: [],
+  cargoRows: [],
   supervisorView: localStorage.getItem(STORAGE_KEYS.supervisorView) || "",
   reportModule: "summary",
   dashboardTurn: "todos",
   dashboardTrend: "hours",
+  summaryQuery: "",
+  summaryDateFrom: "",
+  summaryDateTo: "",
+  summaryStore: "todos",
+  summaryStatus: "todos",
   advancePeriod: "day",
   advanceStore: "todos",
   advanceStatus: "todos",
+  sentQuery: "",
+  sentDateFrom: "",
+  sentDateTo: "",
+  sentStore: "todos",
+  sentStatusFilter: "todos",
+  sentDetailKey: "",
   selectedIncidentIds: new Set(),
   validatorView: localStorage.getItem(STORAGE_KEYS.validatorView) || "",
   validations: loadValidations(),
@@ -89,7 +108,16 @@ function loadValidations() {
     localStorage.setItem(STORAGE_KEYS.validationVersion, VALIDATION_VERSION);
     return {};
   }
-  return loadJson(STORAGE_KEYS.validations, {});
+  const validations = loadJson(STORAGE_KEYS.validations, {});
+  let changed = false;
+  Object.entries(validations).forEach(([key, validation]) => {
+    if (validation?.status === "incidence" || validation?.status === "reported") {
+      delete validations[key];
+      changed = true;
+    }
+  });
+  if (changed) saveJson(STORAGE_KEYS.validations, validations);
+  return validations;
 }
 
 function normalize(value) {
@@ -141,8 +169,34 @@ function totalPrice(row) {
 
 function missingPrice(row, missingBultos) {
   const totalBultos = bultos(row);
-  const unitsPerBulto = totalBultos ? toNumber(row.UnAct) / totalBultos : toNumber(row["Und x Caja"]);
-  return toNumber(missingBultos) * unitsPerBulto * unitCost(row);
+  const missing = toNumber(missingBultos);
+  const units = toNumber(row.UnAct);
+  const cost = unitCost(row);
+  const unitsPerBulto = totalBultos > 0 && units > 0
+    ? units / totalBultos
+    : toNumber(row["Und x Caja"]);
+  const calculated = missing * unitsPerBulto * cost;
+  if (calculated > 0) return calculated;
+  if (totalBultos > 0 && totalPrice(row) > 0) {
+    return totalPrice(row) * Math.min(1, missing / totalBultos);
+  }
+  return 0;
+}
+
+function missingUnits(row, missingBultos) {
+  const totalBultos = bultos(row);
+  const units = toNumber(row.UnAct);
+  if (totalBultos > 0 && units > 0) return toNumber(missingBultos) * (units / totalBultos);
+  return toNumber(missingBultos) * toNumber(row["Und x Caja"]);
+}
+
+function missingPreview(row, missingBultos) {
+  const missing = Math.max(0, toNumber(missingBultos));
+  return {
+    units: missingUnits(row, missing),
+    price: missingPrice(row, missing),
+    unitCost: unitCost(row),
+  };
 }
 
 function parseCsv(text) {
@@ -331,7 +385,11 @@ async function loadReportIncidents(options = {}) {
   if (!silent) render();
   try {
     const previousSignature = JSON.stringify(state.incidents);
-    const remoteRows = await loadReportViaJsonp();
+    const [remoteRows] = await Promise.all([
+      loadReportViaJsonp(),
+      canViewSupervisorReport() ? loadSentRows({ silent: true }) : Promise.resolve(),
+      canViewSupervisorReport() ? loadCargoRows({ silent: true }) : Promise.resolve(),
+    ]);
     const nextIncidents = remoteRows.map(normalizeIncidentForExport).filter(isCleanIncident);
     const nextSignature = JSON.stringify(nextIncidents);
     const activeElement = document.activeElement;
@@ -378,6 +436,36 @@ async function loadSheetRows(sheetName) {
     const response = await fetch(url.toString(), { cache: "no-store" });
     if (!response.ok) throw new Error(`No se pudo leer la hoja (${response.status})`);
     return parseCsv(await response.text());
+  }
+}
+
+async function loadSentRows(options = {}) {
+  const silent = Boolean(options.silent);
+  if (!canViewSupervisorReport()) return;
+  state.sentStatus = silent ? state.sentStatus : "loading";
+  state.sentError = "";
+  try {
+    state.sentRows = (await loadSheetRows(SHEETS.sent)).map(normalizeSentRow).filter((row) => row.pallet);
+    state.sentStatus = "ready";
+  } catch (error) {
+    state.sentStatus = "error";
+    state.sentError = "No se pudo leer la hoja ENVIADO en este momento.";
+    if (!silent) toast("No se pudo leer ENVIADO.");
+  }
+}
+
+async function loadCargoRows(options = {}) {
+  const silent = Boolean(options.silent);
+  if (!canViewSupervisorReport()) return;
+  state.cargoStatus = silent ? state.cargoStatus : "loading";
+  state.cargoError = "";
+  try {
+    state.cargoRows = (await loadSheetRows(SHEETS.cargo)).map(normalizeCargoRow).filter((row) => row.carga);
+    state.cargoStatus = "ready";
+  } catch (error) {
+    state.cargoStatus = "error";
+    state.cargoError = "No se pudo leer la hoja CARGA en este momento.";
+    if (!silent) toast("No se pudo leer CARGA.");
   }
 }
 
@@ -574,14 +662,12 @@ function resetPage() {
   state.query = "";
   state.selectedKey = "";
   state.selectedMode = "pallet";
-  state.validations = Object.fromEntries(
-    Object.entries(state.validations).filter(([, validation]) => validation?.status === "incidence"),
-  );
+  state.validations = {};
   state.missingModalRowKey = "";
   state.groupCacheMode = "";
   state.groupCache = [];
   saveJson(STORAGE_KEYS.validations, state.validations);
-  toast("Validaciones reiniciadas. Las incidencias se mantienen.");
+  toast("Validaciones reiniciadas. Las incidencias se leen desde el reporte.");
   render();
 }
 
@@ -594,17 +680,14 @@ function renderValidatorViewPicker() {
           <div>
             <span class="eyebrow">Validador de pallets</span>
             <h1>Escoge la vista</h1>
-            <p class="muted">La logica sera la misma. Solo cambia la forma de mostrar el validador.</p>
           </div>
         </div>
         <div class="view-options">
           <button class="view-option" data-validator-view="mobile">
             <strong>Vista movil</strong>
-            <span>Botones grandes, lectura vertical y mas comoda para celular.</span>
           </button>
           <button class="view-option" data-validator-view="desktop">
             <strong>Vista escritorio</strong>
-            <span>Tabla amplia, busqueda y validacion pensada para pantalla grande.</span>
           </button>
         </div>
         <button class="btn ghost" id="logoutBtn">Salir</button>
@@ -626,17 +709,14 @@ function renderSupervisorViewPicker() {
           <div>
             <span class="eyebrow">Supervisor</span>
             <h1>Escoge la vista</h1>
-            <p class="muted">Selecciona si vas a gestionar incidencias o revisar indicadores.</p>
           </div>
         </div>
         <div class="view-options">
           <button class="view-option" data-supervisor-view-choice="data">
             <strong>Data</strong>
-            <span>Listado de incidencias, regularizacion, eliminacion y exportacion.</span>
           </button>
           <button class="view-option" data-supervisor-view-choice="report">
             <strong>Reporte</strong>
-            <span>Dashboard con indicadores, tendencias y graficos por turno.</span>
           </button>
         </div>
         <button class="btn ghost" id="logoutBtn">Salir</button>
@@ -743,6 +823,9 @@ async function reportIncident(row, missingBultosValue) {
   const expectedBultos = bultos(row);
   const missing = Math.max(0, toNumber(missingBultosValue));
   const incidentPrice = missingPrice(row, missing);
+  const incidentUnits = missingUnits(row, missing);
+  const incidentUnitCost = unitCost(row);
+  const rowTotalPrice = totalPrice(row);
 
   if (!missing) {
     toast("Ingresa la cantidad de bultos faltantes.");
@@ -751,6 +834,11 @@ async function reportIncident(row, missingBultosValue) {
 
   if (missing > expectedBultos) {
     toast("El faltante no puede ser mayor que los bultos esperados.");
+    return;
+  }
+
+  if (rowTotalPrice > 0 && incidentPrice <= 0) {
+    toast("No se pudo calcular el precio del faltante. Revisa el costo del producto.");
     return;
   }
 
@@ -764,6 +852,8 @@ async function reportIncident(row, missingBultosValue) {
     descripcion: row["Descrip ArtÃ­c"] || "",
     bultos: missing.toFixed(2),
     precio: incidentPrice.toFixed(2),
+    costo_unitario: incidentUnitCost.toFixed(4),
+    unidades_faltantes: incidentUnits.toFixed(2),
     estado: "Pendiente",
   };
 
@@ -776,7 +866,7 @@ async function reportIncident(row, missingBultosValue) {
       state.validations[key] = {
         found: Number(Math.max(0, expectedBultos - missing).toFixed(2)),
         missing: Number(missing.toFixed(2)),
-        status: "incidence",
+        status: "reported",
         at: new Date().toISOString(),
         user: state.user.user,
       };
@@ -848,6 +938,81 @@ function exportIncidents() {
   link.download = `incidencias-pallets-${new Date().toISOString().slice(0, 10)}.xls`;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function downloadExcelFile(filename, headers, rows) {
+  const tableRows = rows.map((row) => `<tr>${headers.map((header) => `<td>${escapeHtml(row[header] ?? "")}</td>`).join("")}</tr>`);
+  const html = `
+    <html>
+      <head><meta charset="UTF-8" /></head>
+      <body>
+        <table>
+          <thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("")}</tr></thead>
+          <tbody>${tableRows.join("")}</tbody>
+        </table>
+      </body>
+    </html>
+  `;
+  const blob = new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function exportSentReport() {
+  const rows = filteredSentIncidentRows(sentIncidentRows());
+  if (!rows.length) {
+    toast("No hay data filtrada para exportar.");
+    return;
+  }
+  const headers = [
+    "estado_envio",
+    "tienda_envio",
+    "pallet",
+    "lpn",
+    "codigo",
+    "descripcion",
+    "estado_incidencia",
+    "bultos",
+    "costo_bruto",
+    "costo_neto",
+    "costo_descontado",
+    "fecha_incidencia",
+    "fecha_regularizado",
+    "nro_carga",
+    "placa",
+    "chofer",
+    "fecha_envio",
+    "paletas_carga",
+  ];
+  const tableRows = rows.map((row) => {
+    const shipment = row._shipment || {};
+    const regularized = row.estado === "Regularizado";
+    return {
+      estado_envio: row._sent ? "Enviado" : "En CD",
+      tienda_envio: shipment.tienda || row.tienda || "",
+      pallet: row.pallet || "",
+      lpn: row.lpn || "",
+      codigo: row.codigos || "",
+      descripcion: row.descripcion || "",
+      estado_incidencia: row.estado || "",
+      bultos: row._bultos.toFixed(2),
+      costo_bruto: money(row._precio),
+      costo_neto: money(regularized ? 0 : row._precio),
+      costo_descontado: regularized ? money(row._precio) : "0.00",
+      fecha_incidencia: row.fecha_incidente || "",
+      fecha_regularizado: row.fecha_regularizado || "",
+      nro_carga: shipment.carga || "",
+      placa: shipment.placa || "",
+      chofer: shipment.chofer || "",
+      fecha_envio: shipment.fechaDespacho || "",
+      paletas_carga: shipment.paletasCarga || "",
+    };
+  });
+  downloadExcelFile(`reporte-enviado-filtrado-${new Date().toISOString().slice(0, 10)}.xls`, headers, tableRows);
 }
 
 function normalizeIncidentForExport(row) {
@@ -939,7 +1104,6 @@ function renderLogin() {
       <form class="login-card" id="loginForm">
         <div class="brand-mark">SGE</div>
         <h1>SGE Pallets</h1>
-        <p class="muted">Ingreso para revisar pallets, LPN y productos faltantes.</p>
         <div class="form-row">
           <label for="user">Usuario</label>
           <input id="user" name="user" autocomplete="username" required />
@@ -1068,12 +1232,11 @@ function renderSupervisorApp() {
 
 function renderSearchResults(groups) {
   if (!state.query.trim()) {
-    return `<div class="search-hint">Busca un pallet, LPN, codigo, estilo o descripcion para ver coincidencias.</div>`;
+    return `<div class="search-hint">Busqueda lista.</div>`;
   }
   return `
     <div class="result-summary">
       <strong>${groups.length ? `${groups.length} coincidencias` : "Sin coincidencias"}</strong>
-      <span class="muted">Selecciona un resumen para abrir el detalle.</span>
     </div>
     <div class="result-list">
       ${groups.map(renderResultCard).join("") || `<p class="muted">No se encontro data con ese criterio.</p>`}
@@ -1186,7 +1349,8 @@ function renderMobileValidationList(rows) {
 function renderMobileProductCard(row) {
   const key = validationKey(row);
   const saved = state.validations[key] || {};
-  const status = saved.status === "incidence" || rowHasReportIncident(row) ? "incidence" : saved.status === "ok" ? "ok" : "pending";
+  const hasReportIncident = rowHasReportIncident(row);
+  const status = hasReportIncident ? "incidence" : saved.status === "ok" ? "ok" : "pending";
   const statusLabel = status === "incidence" ? "Incidencia" : status === "ok" ? "Validado" : "Pendiente";
   const searchText = [row.Codigo, row["Descrip ArtÃ­c"]].join(" ").toLowerCase();
 
@@ -1219,7 +1383,8 @@ function renderProductRow(row) {
   const expected = toNumber(row.UnAct);
   const expectedBultos = bultos(row);
   const found = Number(expectedBultos.toFixed(2));
-  const status = saved.status === "incidence" ? "incidence" : saved.status === "ok" ? "ok" : "pending";
+  const hasReportIncident = rowHasReportIncident(row);
+  const status = hasReportIncident ? "incidence" : saved.status === "ok" ? "ok" : "pending";
   const statusLabel = status === "incidence" ? "Incidencia" : status === "ok" ? "Validado" : "Pendiente";
   const searchText = [row.Codigo, row.Estilo, row["Descrip ArtÃ­c"]].join(" ").toLowerCase();
   return `
@@ -1306,6 +1471,10 @@ function renderMissingModal() {
           <label for="missingBultos">Bultos faltantes</label>
           <input id="missingBultos" name="missingBultos" type="number" min="0.01" step="0.01" max="${expectedBultos.toFixed(2)}" required />
         </div>
+        <div class="missing-cost-preview" id="missingCostPreview">
+          <div><span>Unidades faltantes</span><strong>0.00</strong></div>
+          <div><span>Precio a reportar</span><strong>S/ 0.00</strong></div>
+        </div>
         <div class="modal-actions">
           <button class="btn ghost" type="button" id="cancelMissingBtn">Cancelar</button>
           <button class="btn danger" type="submit">Guardar faltante</button>
@@ -1321,15 +1490,36 @@ function parseIncidentDate(value) {
   if (!raw) return null;
   const direct = new Date(raw);
   if (!Number.isNaN(direct.getTime())) return direct;
-  const match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:,\s*)?(\d{1,2})?:?(\d{1,2})?:?(\d{1,2})?\s*(a\.\s*m\.|p\.\s*m\.|AM|PM)?/i);
+  const match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:,\s*)?(\d{1,2})?:?(\d{1,2})?:?(\d{1,2})?\s*(a\.\s*m\.|p\.\s*m\.|AM|PM)?/i);
   if (!match) return null;
   let hour = Number(match[4] || 0);
   const minute = Number(match[5] || 0);
   const second = Number(match[6] || 0);
+  const year = Number(match[3]) < 100 ? 2000 + Number(match[3]) : Number(match[3]);
   const meridian = normalize(match[7]).toLowerCase();
   if (meridian.includes("p") && hour < 12) hour += 12;
   if (meridian.includes("a") && hour === 12) hour = 0;
-  return new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]), hour, minute, second);
+  return new Date(year, Number(match[2]) - 1, Number(match[1]), hour, minute, second);
+}
+
+function dateInputValue(date) {
+  if (!date || Number.isNaN(date.getTime())) return "";
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function rowOperationalDate(row) {
+  return parseIncidentDate(row?._shipment?.fechaDespacho) || row?._date || null;
+}
+
+function normalizeSearch(value) {
+  return normalize(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 }
 
 function incidentTurn(date) {
@@ -1348,6 +1538,99 @@ function turnLabel(turn) {
     noche: "Noche",
     sin_fecha: "Sin fecha",
   }[turn] || "Todos";
+}
+
+function palletKey(value) {
+  return normalize(value).toUpperCase().replace(/\s+/g, "");
+}
+
+function cargoKey(value) {
+  return normalize(value).toUpperCase().replace(/\s+/g, "");
+}
+
+function normalizeSentRow(row) {
+  const fechaDespacho = field(row, [
+    "Fe y Hr de Despacho",
+    "FECHA DESPACHO",
+    "Fecha Despacho",
+    "FECHA_DESPACHO",
+    "Fecha",
+    "FECHA",
+  ]);
+  return {
+    raw: row,
+    pallet: field(row, ["Nro Pallet", "NroPallet", "NRO PALLET", "PALLET", "Pallet", "Nro pallet"]),
+    lpn: field(row, ["Nro LPNs", "Nro LPN", "LPN", "NRO LPN", "NRO LPNS"]),
+    tienda: field(row, ["Destino", "DESTINO", "Tienda", "TIENDA", "Cod Destino", "COD DESTINO"]),
+    local: field(row, ["Nombre Destino", "NOMBRE DESTINO", "Local", "LOCAL", "Tienda", "TIENDA"]),
+    placa: field(row, ["Placa", "PLACA", "Vehiculo", "VEHICULO", "Camion", "CAMION"]),
+    carga: field(row, ["Nro Carga", "NRO CARGA", "Carga", "CARGA", "Nro Ola", "OLA"]),
+    fechaDespacho,
+    hora: field(row, ["Hora", "HORA", "Turno", "TURNO"]),
+  };
+}
+
+function normalizeCargoRow(row) {
+  return {
+    raw: row,
+    carga: field(row, ["Nro Carga", "NRO CARGA", "Carga", "CARGA", "Nro Ola", "OLA"]),
+    placa: field(row, [
+      "Nro Camión",
+      "Nro Camion",
+      "Nro CamiÃ³n",
+      "NRO CAMION",
+      "NRO CAMIÓN",
+      "Placa",
+      "PLACA",
+      "Vehiculo",
+      "VEHICULO",
+    ]),
+    chofer: field(row, ["Chofer", "CHOFER", "NOMBRE DEL CHOFER", "Nombre del Chofer", "Nombre Chofer"]),
+    fechaEnvio: field(row, [
+      "Fe Y Hr Modif",
+      "Fe y Hr Modif",
+      "FE Y HR MODIF",
+      "Fecha de Envio",
+      "FECHA DE ENVIO",
+      "Fecha Envio",
+      "FECHA ENVIO",
+    ]),
+    paletas: field(row, ["No-LPN Paletas", "NO-LPN PALETAS", "No LPN Paletas", "Nro Paletas", "Paletas", "PALETAS"]),
+  };
+}
+
+function sentPalletMap() {
+  const map = new Map();
+  state.sentRows.forEach((row) => {
+    const key = palletKey(row.pallet);
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(row);
+  });
+  return map;
+}
+
+function cargoMap() {
+  const map = new Map();
+  state.cargoRows.forEach((row) => {
+    const key = cargoKey(row.carga);
+    if (key && !map.has(key)) map.set(key, row);
+  });
+  return map;
+}
+
+function enrichShipmentWithCargo(shipment, cargos = cargoMap()) {
+  if (!shipment) return null;
+  const cargo = cargos.get(cargoKey(shipment.carga));
+  return {
+    ...shipment,
+    _cargo: cargo || null,
+    carga: shipment.carga || cargo?.carga || "",
+    placa: cargo?.placa || shipment.placa || "",
+    chofer: cargo?.chofer || "",
+    fechaDespacho: cargo?.fechaEnvio || shipment.fechaDespacho || "",
+    paletasCarga: cargo?.paletas || "",
+  };
 }
 
 function dashboardRows() {
@@ -1382,6 +1665,25 @@ function allDashboardRows() {
         _precio: toNumber(incident.precio),
       };
     });
+}
+
+function summaryStores(rows) {
+  return [...new Set(rows.map((row) => normalize(row.tienda)).filter(Boolean))].sort();
+}
+
+function filteredSummaryDashboardRows(rows) {
+  const query = normalizeSearch(state.summaryQuery);
+  return rows.filter((row) => {
+    const text = normalizeSearch([row.tienda, row.pallet, row.lpn, row.codigos, row.descripcion, row.estado].join(" "));
+    const dateValue = dateInputValue(row._date);
+    const turnMatch = state.dashboardTurn === "todos" || row._turn === state.dashboardTurn;
+    const queryMatch = !query || text.includes(query);
+    const storeMatch = state.summaryStore === "todos" || normalize(row.tienda) === state.summaryStore;
+    const statusMatch = state.summaryStatus === "todos" || row.estado === state.summaryStatus;
+    const fromMatch = !state.summaryDateFrom || (dateValue && dateValue >= state.summaryDateFrom);
+    const toMatch = !state.summaryDateTo || (dateValue && dateValue <= state.summaryDateTo);
+    return turnMatch && queryMatch && storeMatch && statusMatch && fromMatch && toMatch;
+  });
 }
 
 function groupSum(rows, keyGetter) {
@@ -1455,7 +1757,7 @@ function trendByHour(rows) {
 }
 
 function renderLineChart(points, valueKey = "count", valueLabel = "incidencias") {
-  if (!points.length) return `<div class="chart-empty">Sin data para graficar.</div>`;
+  if (!points.length) return `<div class="chart-empty">Sin data.</div>`;
   const width = 720;
   const height = 220;
   const pad = 28;
@@ -1539,7 +1841,7 @@ function trendDirection(points) {
 }
 
 function renderAdvanceChart(points) {
-  if (!points.length) return `<div class="chart-empty">Sin data para el avance.</div>`;
+  if (!points.length) return `<div class="chart-empty">Sin data.</div>`;
   const width = 760;
   const height = 300;
   const padX = 46;
@@ -1643,6 +1945,390 @@ function renderAdvanceReport() {
   `;
 }
 
+function sentIncidentRows() {
+  const sentMap = sentPalletMap();
+  const cargos = cargoMap();
+  return allDashboardRows().map((row) => {
+    const matches = (sentMap.get(palletKey(row.pallet)) || []).map((shipment) => enrichShipmentWithCargo(shipment, cargos));
+    return {
+      ...row,
+      _sent: matches.length > 0,
+      _shipment: matches[0] || null,
+      _shipments: matches,
+    };
+  });
+}
+
+function filteredSentIncidentRows(rows) {
+  const query = normalizeSearch(state.sentQuery);
+  const from = state.sentDateFrom;
+  const to = state.sentDateTo;
+  return rows.filter((row) => {
+    const shipment = row._shipment || {};
+    const text = normalizeSearch([
+      row.pallet,
+      row.lpn,
+      row.codigos,
+      row.descripcion,
+      row.tienda,
+      shipment.tienda,
+      shipment.local,
+      shipment.carga,
+      shipment.placa,
+      shipment.chofer,
+    ].join(" "));
+    const textMatch = !query || text.includes(query);
+    const statusMatch =
+      state.sentStatusFilter === "todos" ||
+      (state.sentStatusFilter === "enviado" && row._sent) ||
+      (state.sentStatusFilter === "cd" && !row._sent) ||
+      row.estado === state.sentStatusFilter;
+    const storeValue = normalize(shipment.tienda || row.tienda || "Sin tienda");
+    const storeMatch = state.sentStore === "todos" || storeValue === state.sentStore;
+    const dateValue = dateInputValue(rowOperationalDate(row));
+    const fromMatch = !from || (dateValue && dateValue >= from);
+    const toMatch = !to || (dateValue && dateValue <= to);
+    return textMatch && statusMatch && storeMatch && fromMatch && toMatch;
+  });
+}
+
+function shipmentStoreSummaries(incidentRows = null) {
+  const cargos = cargoMap();
+  const allowedKeys = incidentRows
+    ? new Set(
+        incidentRows
+          .filter((row) => row._sent && row._shipment)
+          .map((row) => `${cargoKey(row._shipment.carga) || "SIN CARGA"}|${normalize(row._shipment.tienda || "Sin tienda")}`),
+      )
+    : null;
+  const map = new Map();
+  state.sentRows.forEach((row) => {
+    const shipment = enrichShipmentWithCargo(row, cargos);
+    const pallet = palletKey(shipment?.pallet);
+    if (!pallet) return;
+    const carga = cargoKey(shipment.carga) || "SIN CARGA";
+    const tienda = normalize(shipment.tienda || "Sin tienda");
+    const key = `${carga}|${tienda}`;
+    if (allowedKeys && !allowedKeys.has(key)) return;
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        carga: shipment.carga || "Sin carga",
+        tienda,
+        local: shipment.local || "",
+        placa: shipment.placa || "",
+        chofer: shipment.chofer || "",
+        fechaEnvio: shipment.fechaDespacho || "",
+        paletasCarga: shipment.paletasCarga || "",
+        pallets: new Set(),
+      });
+    }
+    map.get(key).pallets.add(pallet);
+  });
+  return [...map.values()]
+    .map((row) => ({ ...row, count: row.pallets.size }))
+    .sort((a, b) => b.count - a.count || a.tienda.localeCompare(b.tienda));
+}
+
+function sentStores(rows) {
+  return [...new Set(rows.map((row) => normalize(row._shipment?.tienda || row.tienda)).filter(Boolean))].sort();
+}
+
+function sentDetailRows(detailKey) {
+  const cargos = cargoMap();
+  const incidentsByPallet = new Map();
+  allDashboardRows().forEach((row) => {
+    const key = palletKey(row.pallet);
+    if (!key) return;
+    if (!incidentsByPallet.has(key)) incidentsByPallet.set(key, []);
+    incidentsByPallet.get(key).push(row);
+  });
+
+  const map = new Map();
+  state.sentRows.forEach((row) => {
+    const shipment = enrichShipmentWithCargo(row, cargos);
+    const key = `${cargoKey(shipment.carga) || "SIN CARGA"}|${normalize(shipment.tienda || "Sin tienda")}`;
+    if (key !== detailKey) return;
+    const pallet = palletKey(shipment.pallet);
+    if (!pallet || map.has(pallet)) return;
+    map.set(pallet, {
+      pallet: shipment.pallet,
+      lpn: shipment.lpn,
+      tienda: shipment.tienda,
+      local: shipment.local,
+      carga: shipment.carga,
+      placa: shipment.placa,
+      chofer: shipment.chofer,
+      fechaDespacho: shipment.fechaDespacho,
+      paletasCarga: shipment.paletasCarga,
+      incidents: incidentsByPallet.get(pallet) || [],
+    });
+  });
+
+  return [...map.values()].sort((a, b) => Number(Boolean(b.incidents.length)) - Number(Boolean(a.incidents.length)) || palletKey(a.pallet).localeCompare(palletKey(b.pallet)));
+}
+
+function renderSentDetailModal() {
+  if (!state.sentDetailKey) return "";
+  const rows = sentDetailRows(state.sentDetailKey);
+  const first = rows[0] || {};
+  const affected = rows.filter((row) => row.incidents.length);
+  const affectedCost = affected.reduce((sum, row) => {
+    return sum + row.incidents.filter((incident) => incident.estado !== "Regularizado").reduce((subtotal, incident) => subtotal + incident._precio, 0);
+  }, 0);
+  return `
+    <div class="modal-backdrop">
+      <section class="sent-detail-modal" role="dialog" aria-modal="true">
+        <div class="modal-head">
+          <div>
+            <span class="eyebrow">Detalle de carga enviada</span>
+            <h3>Tienda ${escapeHtml(first.tienda || "Sin tienda")}</h3>
+            <p class="muted">Carga ${escapeHtml(first.carga || "-")} · Placa ${escapeHtml(first.placa || "-")} · ${escapeHtml(first.chofer || "Sin chofer")}</p>
+          </div>
+          <button class="icon-btn" id="closeSentDetailBtn" type="button" aria-label="Cerrar">×</button>
+        </div>
+        <div class="sent-detail-kpis">
+          <div><span>Pallets enviados</span><strong>${rows.length}</strong></div>
+          <div><span>Pallets afectados</span><strong>${affected.length}</strong></div>
+          <div><span>Costo pendiente</span><strong>S/ ${money(affectedCost)}</strong></div>
+          <div><span>Fecha envio</span><strong>${escapeHtml(first.fechaDespacho || "-")}</strong></div>
+        </div>
+        <div class="sent-detail-list">
+          ${rows.map((row) => {
+            const incident = row.incidents[0];
+            const affectedClass = incident ? "affected" : "";
+            return `
+              <article class="sent-detail-item ${affectedClass}">
+                <div>
+                  <span class="badge ${incident ? "missing" : "ok"}">${incident ? "Pallet afectado" : "Sin incidencia"}</span>
+                  <strong>${escapeHtml(row.pallet || "-")}</strong>
+                  <small>${escapeHtml(row.lpn || "")}</small>
+                </div>
+                <div>
+                  ${incident ? `<b>${escapeHtml(incident.descripcion)}</b><small>${escapeHtml(incident.estado)} · ${incident._bultos.toFixed(2)} bultos · S/ ${money(incident.estado === "Regularizado" ? 0 : incident._precio)}</small>` : `<span class="muted">Pallet enviado sin incidencia registrada.</span>`}
+                </div>
+              </article>
+            `;
+          }).join("") || `<div class="chart-empty">No se encontraron pallets para esta carga.</div>`}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderPalletBars(items) {
+  if (!items.length) return `<div class="chart-empty">Sin cargas.</div>`;
+  const total = Math.max(...items.map((item) => item.count), 1);
+  return `
+    <div class="shipment-store-list">
+      ${items
+        .map((item) => {
+          const percent = Math.max(6, (item.count / total) * 100);
+          return `
+            <button class="shipment-store-row" type="button" data-sent-detail="${escapeAttr(item.key)}">
+              <div>
+                <strong>Tienda ${escapeHtml(item.tienda)}</strong>
+                <small>Carga ${escapeHtml(item.carga)}${item.placa ? ` · Placa ${escapeHtml(item.placa)}` : ""}${item.chofer ? ` · ${escapeHtml(item.chofer)}` : ""}</small>
+              </div>
+              <span>${item.count} pallets</span>
+              <i><b style="width:${percent}%"></b></i>
+            </button>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderSentLogisticsDonut(items) {
+  const total = items.reduce((sum, item) => sum + item.value, 0);
+  const fallbackTotal = items.reduce((sum, item) => sum + item.count, 0);
+  let cursor = 0;
+  const segments = items.map((item, index) => {
+    const basis = total || fallbackTotal || 1;
+    const value = total ? item.value : item.count;
+    const start = cursor;
+    const end = cursor + (value / basis) * 100;
+    cursor = end;
+    return `${item.color} ${start.toFixed(2)}% ${end.toFixed(2)}%`;
+  });
+  return `
+    <div class="sent-logistics-donut">
+      <div class="sent-donut" style="--segments:${segments.join(", ")}">
+        <strong>${total ? "100%" : "0%"}</strong>
+        <span>Total</span>
+      </div>
+      <div class="sent-donut-legend">
+        ${items.map((item) => {
+          const percent = total ? (item.value / total) * 100 : fallbackTotal ? (item.count / fallbackTotal) * 100 : 0;
+          return `
+            <div class="sent-donut-row">
+              <i style="background:${item.color}"></i>
+              <div>
+                <strong>${escapeHtml(item.label)}</strong>
+                <small>${percent.toFixed(1)}%</small>
+              </div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderSentIncidentsReport() {
+  const rows = sentIncidentRows();
+  const filteredRows = filteredSentIncidentRows(rows);
+  const sentRows = filteredRows.filter((row) => row._sent);
+  const cdRows = filteredRows.filter((row) => !row._sent);
+  const sentGrossCost = sentRows.reduce((sum, row) => sum + row._precio, 0);
+  const sentRegularizedRows = sentRows.filter((row) => row.estado === "Regularizado");
+  const sentPendingRows = sentRows.filter((row) => row.estado === "Pendiente");
+  const sentDiscountCost = sentRegularizedRows.reduce((sum, row) => sum + row._precio, 0);
+  const sentNetCost = sentPendingRows.reduce((sum, row) => sum + row._precio, 0);
+  const cdPendingRows = cdRows.filter((row) => row.estado === "Pendiente");
+  const cdCost = cdPendingRows.reduce((sum, row) => sum + row._precio, 0);
+  const sentPallets = new Set(sentRows.map((row) => palletKey(row.pallet)).filter(Boolean)).size;
+  const topStores = groupSum(sentPendingRows, (row) => {
+    const shipment = row._shipment || {};
+    const store = shipment.tienda || row.tienda || "Sin tienda";
+    const local = shipment.local && shipment.local !== shipment.tienda ? ` · ${shipment.local}` : "";
+    return `Tienda ${store}${local}`;
+  }).slice(0, 6);
+  const storesByCargo = shipmentStoreSummaries(filteredRows).slice(0, 8);
+  const stores = sentStores(rows);
+
+  return `
+    <div class="sent-report">
+      ${state.sentStatus === "error" ? `<p class="notice">${escapeHtml(state.sentError)}</p>` : ""}
+      ${state.cargoStatus === "error" ? `<p class="notice">${escapeHtml(state.cargoError)}</p>` : ""}
+      <div class="sent-hero">
+        <div>
+          <span class="eyebrow">Cruce incidencias vs enviado + carga</span>
+          <h3>Pallets con incidencia enviados a tienda</h3>
+        </div>
+        <strong>${sentPallets}<small>pallets enviados</small></strong>
+      </div>
+      <div class="sent-filters">
+        <label class="span-2">
+          <span>Buscar</span>
+          <input id="sentQuery" value="${escapeAttr(state.sentQuery)}" placeholder="Pallet, carga, placa, chofer, tienda o producto" />
+        </label>
+        <label>
+          <span>Tienda</span>
+          <select id="sentStore">
+            <option value="todos">Todas</option>
+            ${stores.map((store) => `<option value="${escapeAttr(store)}" ${state.sentStore === store ? "selected" : ""}>${escapeHtml(store)}</option>`).join("")}
+          </select>
+        </label>
+        <label>
+          <span>Estado</span>
+          <select id="sentStatusFilter">
+            <option value="todos" ${state.sentStatusFilter === "todos" ? "selected" : ""}>Todos</option>
+            <option value="enviado" ${state.sentStatusFilter === "enviado" ? "selected" : ""}>Enviados</option>
+            <option value="cd" ${state.sentStatusFilter === "cd" ? "selected" : ""}>En CD</option>
+            <option value="Pendiente" ${state.sentStatusFilter === "Pendiente" ? "selected" : ""}>Pendientes</option>
+            <option value="Regularizado" ${state.sentStatusFilter === "Regularizado" ? "selected" : ""}>Regularizados</option>
+          </select>
+        </label>
+        <label>
+          <span>Desde</span>
+          <input id="sentDateFrom" type="date" value="${escapeAttr(state.sentDateFrom)}" />
+        </label>
+        <label>
+          <span>Hasta</span>
+          <input id="sentDateTo" type="date" value="${escapeAttr(state.sentDateTo)}" />
+        </label>
+        <button class="btn warning" id="sentExportBtn" type="button">Exportar filtrado</button>
+      </div>
+      <div class="dashboard-kpis">
+        <div class="kpi-card"><span>Incidencias enviadas</span><strong>${sentRows.length}</strong><small>${sentPallets} pallets cruzados</small></div>
+        <div class="kpi-card"><span>Costo enviado pendiente</span><strong>S/ ${money(sentNetCost)}</strong><small>Neto</small></div>
+        <div class="kpi-card"><span>Regularizado descontado</span><strong>S/ ${money(sentDiscountCost)}</strong><small>Bruto: S/ ${money(sentGrossCost)}</small></div>
+        <div class="kpi-card"><span>Costo pendiente en CD</span><strong>S/ ${money(cdCost)}</strong><small>${cdPendingRows.length} pendientes</small></div>
+      </div>
+      <div class="dashboard-grid">
+        <article class="chart-card">
+          <div class="chart-title"><h3>Estado logistico</h3><span>Enviado vs en CD</span></div>
+          ${renderSentLogisticsDonut([
+            { label: "Enviado pendiente", count: sentPendingRows.length, value: sentNetCost, color: "#e8792e" },
+            { label: "Enviado regularizado", count: sentRegularizedRows.length, value: sentDiscountCost, color: "#42784f" },
+            { label: "Aun en CD / sin cruce", count: cdRows.length, value: cdCost, color: "#a83224" },
+          ])}
+          ${renderBars([
+            { key: "Enviado pendiente", count: sentPendingRows.length, bultos: sentPendingRows.reduce((sum, row) => sum + row._bultos, 0), precio: sentNetCost },
+            { key: "Enviado regularizado", count: sentRegularizedRows.length, bultos: sentRegularizedRows.reduce((sum, row) => sum + row._bultos, 0), precio: sentDiscountCost },
+            { key: "Aun en CD / sin cruce", count: cdRows.length, bultos: cdRows.reduce((sum, row) => sum + row._bultos, 0), precio: cdCost },
+          ], sentGrossCost + cdCost, "precio")}
+        </article>
+        <article class="chart-card">
+          <div class="chart-title"><h3>Tiendas impactadas</h3><span>Costo enviado pendiente</span></div>
+          ${renderBars(topStores, sentNetCost, "precio")}
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-title"><h3>Pallets enviados por tienda</h3><span>Por carga, sin duplicar pallet</span></div>
+          ${renderPalletBars(storesByCargo)}
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-title">
+            <div>
+              <h3>Detalle ejecutivo</h3>
+              <span>${filteredRows.length} de ${rows.length} incidencias</span>
+            </div>
+          </div>
+          ${renderSentIncidentsTable(filteredRows)}
+        </article>
+      </div>
+      ${renderSentDetailModal()}
+    </div>
+  `;
+}
+
+function renderSentIncidentsTable(rows) {
+  if (!rows.length) return `<div class="chart-empty">Sin incidencias.</div>`;
+  return `
+    <div class="sent-table-wrap">
+      <table class="sent-table">
+        <thead>
+          <tr>
+            <th>Estado envio</th>
+            <th>Pallet</th>
+            <th>Producto</th>
+            <th>Incidencia</th>
+            <th>Despacho</th>
+            <th>Carga / placa</th>
+            <th>Chofer</th>
+            <th>Costo neto</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .slice()
+            .sort((a, b) => Number(b._sent) - Number(a._sent) || b._precio - a._precio)
+            .slice(0, 80)
+            .map((row) => {
+              const shipment = row._shipment || {};
+              const isRegularized = row.estado === "Regularizado";
+              return `
+                <tr class="${row._sent ? "sent" : "not-sent"}">
+                  <td><span class="badge ${row._sent ? "ok" : "missing"}">${row._sent ? "Enviado" : "En CD"}</span></td>
+                  <td><strong>${escapeHtml(row.pallet || "SIN PALLET")}</strong><small>${escapeHtml(row.lpn || "")}</small></td>
+                  <td>${escapeHtml(row.descripcion)}<small>Codigo ${escapeHtml(row.codigos)}</small></td>
+                  <td>${escapeHtml(row.estado)}<small>${escapeHtml(row.fecha_incidente || "Sin fecha")}</small></td>
+                  <td>${row._sent ? `${escapeHtml(shipment.tienda || row.tienda)}<small>${escapeHtml(shipment.fechaDespacho || shipment.hora || "Sin fecha despacho")}</small>` : `<span class="muted">Sin cruce en ENVIADO</span>`}</td>
+                  <td>${row._sent ? `<strong>${escapeHtml(shipment.carga || "-")}</strong><small>Placa ${escapeHtml(shipment.placa || "-")}</small>` : "-"}</td>
+                  <td>${row._sent ? `${escapeHtml(shipment.chofer || "-")}<small>${shipment.paletasCarga ? `${escapeHtml(shipment.paletasCarga)} paletas carga` : "Sin paletas carga"}</small>` : "-"}</td>
+                  <td><strong>S/ ${money(isRegularized ? 0 : row._precio)}</strong><small>${isRegularized ? `Descontado: S/ ${money(row._precio)}` : `${row._bultos.toFixed(2)} bultos`}</small></td>
+                </tr>
+              `;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 function renderStatusChart(rows) {
   const regularizedRows = rows.filter((row) => row.estado === "Regularizado");
   const pendingRows = rows.filter((row) => row.estado === "Pendiente");
@@ -1658,7 +2344,7 @@ function renderStatusChart(rows) {
     ? regularizados === rows.length
       ? "Todo regularizado"
       : `S/ ${money(pendingCost)} pendientes de cierre`
-    : "Sin incidencias para evaluar";
+    : "Sin incidencias";
   return `
     <div class="status-chart">
       <div class="donut" style="--regularized:${percent.toFixed(1)}%">
@@ -1685,7 +2371,7 @@ function renderStatusChart(rows) {
 }
 
 function renderBars(items, total, label = "bultos") {
-  if (!items.length) return `<div class="chart-empty">Sin data para mostrar.</div>`;
+  if (!items.length) return `<div class="chart-empty">Sin data.</div>`;
   const isMoney = label === "precio";
   const valueKey = isMoney ? "precio" : "bultos";
   const max = Math.max(...items.map((item) => item[valueKey]), 1);
@@ -1726,7 +2412,7 @@ function renderRecentIncidents(rows) {
   const recent = [...rows]
     .sort((a, b) => (b._date?.getTime() || 0) - (a._date?.getTime() || 0))
     .slice(0, 6);
-  if (!recent.length) return `<div class="chart-empty">Sin incidencias recientes.</div>`;
+  if (!recent.length) return `<div class="chart-empty">Sin incidencias.</div>`;
   return `
     <div class="recent-grid">
       ${recent.map((row) => `
@@ -1744,8 +2430,9 @@ function renderRecentIncidents(rows) {
 }
 
 function renderDashboard() {
-  const rows = dashboardRows();
-  const allRows = state.incidents.map(normalizeIncidentForExport).filter(isCleanIncident);
+  const allRows = allDashboardRows();
+  const rows = filteredSummaryDashboardRows(allRows);
+  const stores = summaryStores(allRows);
   const totalBultos = rows.reduce((sum, row) => sum + row._bultos, 0);
   const totalPrecio = rows.reduce((sum, row) => sum + row._precio, 0);
   const precioPendiente = rows.filter((row) => row.estado === "Pendiente").reduce((sum, row) => sum + row._precio, 0);
@@ -1762,12 +2449,13 @@ function renderDashboard() {
       <div class="dashboard-header">
         <div>
           <span class="eyebrow">Dashboard de incidencias</span>
-          <h2>${state.reportModule === "advance" ? "Reporte de avance" : "Reporte ejecutivo"}</h2>
-          <p class="muted">${allRows.length} registros guardados en Google Sheet · Vista ${escapeHtml(turnLabel(state.dashboardTurn))}</p>
+          <h2>${state.reportModule === "advance" ? "Reporte de avance" : state.reportModule === "sent" ? "Incidencias enviadas" : "Reporte ejecutivo"}</h2>
+          <p class="muted">${rows.length} de ${allRows.length} registros · ${escapeHtml(turnLabel(state.dashboardTurn))}</p>
         </div>
         <div class="report-module-tabs">
           <button class="tab ${state.reportModule === "summary" ? "active" : ""}" data-report-module="summary">Resumen</button>
           <button class="tab ${state.reportModule === "advance" ? "active" : ""}" data-report-module="advance">Avance</button>
+          <button class="tab ${state.reportModule === "sent" ? "active" : ""}" data-report-module="sent">Enviado</button>
         </div>
       </div>
       ${state.reportStatus === "loading" ? `<p class="notice">Actualizando reporte...</p>` : ""}
@@ -1775,7 +2463,38 @@ function renderDashboard() {
       ${
         state.reportModule === "advance"
           ? renderAdvanceReport()
+          : state.reportModule === "sent"
+            ? renderSentIncidentsReport()
           : `
+      <div class="summary-filters">
+        <label class="span-2">
+          <span>Buscar</span>
+          <input id="summaryQuery" value="${escapeAttr(state.summaryQuery)}" placeholder="Pallet, LPN, codigo, tienda o producto" />
+        </label>
+        <label>
+          <span>Tienda</span>
+          <select id="summaryStore">
+            <option value="todos">Todas</option>
+            ${stores.map((store) => `<option value="${escapeAttr(store)}" ${state.summaryStore === store ? "selected" : ""}>${escapeHtml(store)}</option>`).join("")}
+          </select>
+        </label>
+        <label>
+          <span>Estado</span>
+          <select id="summaryStatus">
+            <option value="todos" ${state.summaryStatus === "todos" ? "selected" : ""}>Todos</option>
+            <option value="Pendiente" ${state.summaryStatus === "Pendiente" ? "selected" : ""}>Pendientes</option>
+            <option value="Regularizado" ${state.summaryStatus === "Regularizado" ? "selected" : ""}>Regularizados</option>
+          </select>
+        </label>
+        <label>
+          <span>Desde</span>
+          <input id="summaryDateFrom" type="date" value="${escapeAttr(state.summaryDateFrom)}" />
+        </label>
+        <label>
+          <span>Hasta</span>
+          <input id="summaryDateTo" type="date" value="${escapeAttr(state.summaryDateTo)}" />
+        </label>
+      </div>
       <div class="dashboard-filters">
         <button class="tab ${state.dashboardTurn === "todos" ? "active" : ""}" data-dashboard-turn="todos">Todos</button>
         <button class="tab ${state.dashboardTurn === "dia" ? "active" : ""}" data-dashboard-turn="dia">Dia 7-16</button>
@@ -1784,7 +2503,7 @@ function renderDashboard() {
       </div>
       <div class="dashboard-kpis">
         <div class="kpi-card"><span>Incidencias</span><strong>${rows.length}</strong><small>${pendientes} pendientes</small></div>
-        <div class="kpi-card"><span>Costo pendiente</span><strong>S/ ${money(precioPendiente)}</strong><small>Por regularizar</small></div>
+        <div class="kpi-card"><span>Costo pendiente</span><strong>S/ ${money(precioPendiente)}</strong><small>Pendiente</small></div>
         <div class="kpi-card"><span>Costo regularizado</span><strong>S/ ${money(precioRegularizado)}</strong><small>${rows.length ? ((regularizados / rows.length) * 100).toFixed(1) : "0.0"}% incidencias</small></div>
         <div class="kpi-card"><span>Costo total</span><strong>S/ ${money(totalPrecio)}</strong><small>${totalBultos.toFixed(2)} bultos · ${pallets} pallets</small></div>
       </div>
@@ -1807,19 +2526,19 @@ function renderDashboard() {
           ${renderTurnChart(rows)}
         </article>
         <article class="chart-card">
-          <div class="chart-title"><h3>Regularizacion</h3><span>Impacto en soles</span></div>
+          <div class="chart-title"><h3>Regularizacion</h3><span>Soles</span></div>
           ${renderStatusChart(rows)}
         </article>
         <article class="chart-card">
-          <div class="chart-title"><h3>Top productos con incidencia</h3><span>Mayor costo reportado</span></div>
+          <div class="chart-title"><h3>Top productos</h3><span>Costo</span></div>
           ${renderBars(topProductos, totalPrecio, "precio")}
         </article>
         <article class="chart-card">
-          <div class="chart-title"><h3>Top tiendas</h3><span>Mayor impacto economico</span></div>
+          <div class="chart-title"><h3>Top tiendas</h3><span>Costo</span></div>
           ${renderBars(topTiendas, totalPrecio, "precio")}
         </article>
         <article class="chart-card wide recent-card">
-          <div class="chart-title"><h3>Ultimas incidencias</h3><span>Control reciente</span></div>
+          <div class="chart-title"><h3>Ultimas incidencias</h3><span>Recientes</span></div>
           ${renderRecentIncidents(rows)}
         </article>
       </div>
@@ -1835,7 +2554,6 @@ function renderHistory() {
       <div class="history-header">
         <div>
           <h2>Reporte de incidencias</h2>
-          <p class="muted">Muestra solo incidencias guardadas en Google Sheet.</p>
         </div>
         <div class="quick-actions">
           ${canManageIncidents() ? `<button class="btn danger" id="deleteSelectedBtn">Eliminar seleccionadas</button>` : ""}
@@ -1885,7 +2603,7 @@ function renderHistory() {
               `;
               },
             )
-            .join("") || `<p class="muted">Aun no hay incidencias registradas.</p>`
+            .join("") || `<p class="muted">Sin incidencias.</p>`
         }
       </div>
     </section>
@@ -1895,8 +2613,7 @@ function renderHistory() {
 function renderEmpty() {
   return `
     <div class="empty">
-      <h2>Selecciona un pallet o LPN</h2>
-      <p class="muted">Cuando cargue la data, podras revisar el detalle completo y marcar faltantes.</p>
+      <h2>Sin seleccion</h2>
     </div>
   `;
 }
@@ -1939,6 +2656,37 @@ function bindAppEvents(group) {
       render();
     });
   });
+  document.querySelector("#summaryQuery")?.addEventListener("input", (event) => {
+    state.summaryQuery = event.target.value;
+    const cursor = event.target.selectionStart ?? state.summaryQuery.length;
+    window.clearTimeout(queryRenderTimer);
+    queryRenderTimer = window.setTimeout(() => {
+      render();
+      window.requestAnimationFrame(() => {
+        const input = document.querySelector("#summaryQuery");
+        if (!input) return;
+        input.focus();
+        const nextCursor = Math.min(cursor, input.value.length);
+        input.setSelectionRange(nextCursor, nextCursor);
+      });
+    }, 120);
+  });
+  document.querySelector("#summaryStore")?.addEventListener("change", (event) => {
+    state.summaryStore = event.target.value;
+    render();
+  });
+  document.querySelector("#summaryStatus")?.addEventListener("change", (event) => {
+    state.summaryStatus = event.target.value;
+    render();
+  });
+  document.querySelector("#summaryDateFrom")?.addEventListener("change", (event) => {
+    state.summaryDateFrom = event.target.value;
+    render();
+  });
+  document.querySelector("#summaryDateTo")?.addEventListener("change", (event) => {
+    state.summaryDateTo = event.target.value;
+    render();
+  });
   document.querySelector("#advanceStore")?.addEventListener("change", (event) => {
     state.advanceStore = event.target.value;
     render();
@@ -1949,6 +2697,48 @@ function bindAppEvents(group) {
   });
   document.querySelector("#advancePeriod")?.addEventListener("change", (event) => {
     state.advancePeriod = event.target.value;
+    render();
+  });
+  document.querySelector("#sentQuery")?.addEventListener("input", (event) => {
+    state.sentQuery = event.target.value;
+    const cursor = event.target.selectionStart ?? state.sentQuery.length;
+    window.clearTimeout(queryRenderTimer);
+    queryRenderTimer = window.setTimeout(() => {
+      render();
+      window.requestAnimationFrame(() => {
+        const input = document.querySelector("#sentQuery");
+        if (!input) return;
+        input.focus();
+        const nextCursor = Math.min(cursor, input.value.length);
+        input.setSelectionRange(nextCursor, nextCursor);
+      });
+    }, 120);
+  });
+  document.querySelector("#sentStore")?.addEventListener("change", (event) => {
+    state.sentStore = event.target.value;
+    render();
+  });
+  document.querySelector("#sentStatusFilter")?.addEventListener("change", (event) => {
+    state.sentStatusFilter = event.target.value;
+    render();
+  });
+  document.querySelector("#sentDateFrom")?.addEventListener("change", (event) => {
+    state.sentDateFrom = event.target.value;
+    render();
+  });
+  document.querySelector("#sentDateTo")?.addEventListener("change", (event) => {
+    state.sentDateTo = event.target.value;
+    render();
+  });
+  document.querySelector("#sentExportBtn")?.addEventListener("click", exportSentReport);
+  document.querySelectorAll("[data-sent-detail]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.sentDetailKey = button.dataset.sentDetail;
+      render();
+    });
+  });
+  document.querySelector("#closeSentDetailBtn")?.addEventListener("click", () => {
+    state.sentDetailKey = "";
     render();
   });
   bindSearchResultEvents();
@@ -1982,6 +2772,16 @@ function bindAppEvents(group) {
     if (!row) return;
     const form = new FormData(event.currentTarget);
     reportIncident(row, form.get("missingBultos"));
+  });
+  document.querySelector("#missingBultos")?.addEventListener("input", (event) => {
+    const row = state.rowsForBinding.find((item) => validationKey(item) === state.missingModalRowKey);
+    const preview = document.querySelector("#missingCostPreview");
+    if (!row || !preview) return;
+    const totals = missingPreview(row, event.target.value);
+    preview.innerHTML = `
+      <div><span>Unidades faltantes</span><strong>${money(totals.units)}</strong></div>
+      <div><span>Precio a reportar</span><strong>S/ ${money(totals.price)}</strong></div>
+    `;
   });
   if (state.tableQuery) filterValidationTable(state.tableQuery);
 }
