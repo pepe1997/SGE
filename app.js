@@ -7,7 +7,7 @@ const SHEETS = {
   cargo: "CARGA",
 };
 const REPORT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1EBG_HWQ3lp4UWjPtpMgc0UMe_mH53RWtgAtnDMCQ_nc/edit";
-const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbwn62rmKB0CTe8f8stodQQXro1lX1IAM-nVpL7ZXfnkEJ3wRH3_LqadETgQuy0eodpD/exec";
+const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbz2CA6XgPM2z2wAaS5F4kIbNNSZEzn_5SYVphGXGgDKdsppz2YWlIu6KCmdFRrh376z/exec";
 const REPORT_REFRESH_MS = 3000;
 const STORAGE_KEYS = {
   session: "palletValidator.session",
@@ -125,6 +125,9 @@ function normalize(value) {
 }
 
 function toNumber(value) {
+  if (value instanceof Date) {
+    return value.getDate() + ((value.getMonth() + 1) / 100);
+  }
   const raw = normalize(value).replace(/[^\d,.-]/g, "");
   if (!raw) return 0;
   let normalized = raw;
@@ -144,6 +147,13 @@ function money(value) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+function priceToNumber(value) {
+  const text = normalize(value);
+  const dateLike = text.match(/^(\d{1,2})\/(\d{1,2})\/\d{4}/);
+  if (dateLike) return Number(`${dateLike[1]}.${dateLike[2].padStart(2, "0")}`);
+  return toNumber(value);
 }
 
 function field(row, names) {
@@ -1012,7 +1022,11 @@ function exportSentReport() {
 }
 
 function normalizeIncidentForExport(row) {
-  const estado = row.estado === "Regularizado" ? "Regularizado" : "Pendiente";
+  const estado = normalize(row.estado) === "Regularizado" ? "Regularizado" : "Pendiente";
+  const bultosValue = row.bultos ?? row.bultosFaltantes ?? row.faltante ?? "";
+  const precioValue = row.precio ?? row.costo ?? row.importe ?? "";
+  const bultosNumber = toNumber(bultosValue);
+  const precioNumber = priceToNumber(precioValue);
   return {
     id: row.id || "",
     tienda: row.tienda || row.destino || "",
@@ -1020,8 +1034,8 @@ function normalizeIncidentForExport(row) {
     lpn: row.lpn || row.nroLpn || "",
     codigos: row.codigos || row.codigo || "",
     descripcion: row.descripcion && !["Pendiente", "Regularizado"].includes(row.descripcion) ? row.descripcion : row.codigos || row.codigo || "",
-    bultos: row.bultos || row.bultosFaltantes || row.faltante || "",
-    precio: row.precio || row.costo || row.importe || "",
+    bultos: bultosNumber > 0 ? bultosNumber.toFixed(2) : bultosValue,
+    precio: precioNumber > 0 ? precioNumber.toFixed(2) : precioValue,
     estado,
     fecha_incidente: row.fecha_incidente || row.fechaIncidente || row.fechaReporte || row.createdAt || "",
     fecha_regularizado: row.fecha_regularizado || row.fechaRegularizado || "",

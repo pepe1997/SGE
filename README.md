@@ -29,6 +29,6 @@ El reporte esta configurado para guardarse en:
 
 Endpoint configurado:
 
-`https://script.google.com/macros/s/AKfycbwn62rmKB0CTe8f8stodQQXro1lX1IAM-nVpL7ZXfnkEJ3wRH3_LqadETgQuy0eodpD/exec`
+`https://script.google.com/macros/s/AKfycbz2CA6XgPM2z2wAaS5F4kIbNNSZEzn_5SYVphGXGgDKdsppz2YWlIu6KCmdFRrh376z/exec`
 
 El supervisor cambia el estado a `Pendiente` o `Regularizado` desde su pagina de reporte. Al crear la incidencia, el Google Sheet guarda `fecha_incidente`. Al regularizar, guarda `fecha_regularizado`. El reporte de supervisor lee solo lo guardado en Google Sheet y permite exportar Excel con las columnas: tienda, pallet, lpn, codigos, descripcion, bultos, precio, estado, fecha_incidente y fecha_regularizado.

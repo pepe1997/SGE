@@ -120,6 +120,11 @@ function guardarIncidencia(payload) {
   const sheet = getSheet();
   const record = normalizarIncidencia(payload);
   sheet.appendRow(HEADERS.map((header) => record[header] ?? ""));
+  const precioIndex = HEADERS.indexOf("precio") + 1;
+  const bultosIndex = HEADERS.indexOf("bultos") + 1;
+  const newRow = sheet.getLastRow();
+  if (precioIndex > 0) sheet.getRange(newRow, precioIndex).setNumberFormat("0.00");
+  if (bultosIndex > 0) sheet.getRange(newRow, bultosIndex).setNumberFormat("0.00");
   formatSheet(sheet);
   return record;
 }
@@ -135,7 +140,13 @@ function listarIncidencias() {
   return values.slice(1).filter((row) => row.some((cell) => cell !== "")).map((row) => {
     const record = {};
     headers.forEach((header, index) => {
-      record[header] = row[index] instanceof Date ? row[index].toLocaleString("es-PE") : row[index];
+      if (header === "precio") {
+        record[header] = normalizarNumeroReporte(row[index], 2);
+      } else if (header === "bultos") {
+        record[header] = normalizarNumeroReporte(row[index], 2);
+      } else {
+        record[header] = row[index] instanceof Date ? row[index].toLocaleString("es-PE") : row[index];
+      }
     });
     return record;
   }).reverse();
@@ -195,6 +206,8 @@ function normalizarIds(idsInput) {
 }
 
 function normalizarIncidencia(payload) {
+  const bultos = normalizarNumeroReporte(payload.bultos || payload.bultosFaltantes || payload.faltante || "", 2);
+  const precio = normalizarNumeroReporte(payload.precio || payload.costo || payload.importe || "", 2);
   return {
     id: payload.id || Utilities.getUuid(),
     tienda: payload.tienda || payload.destino || "",
@@ -202,12 +215,37 @@ function normalizarIncidencia(payload) {
     lpn: payload.lpn || payload.nroLpn || "",
     codigos: payload.codigos || payload.codigo || "",
     descripcion: payload.descripcion || "",
-    bultos: payload.bultos || payload.bultosFaltantes || payload.faltante || "",
-    precio: payload.precio || payload.costo || payload.importe || "",
+    bultos,
+    precio,
     estado: "Pendiente",
     fecha_incidente: payload.fecha_incidente || payload.fechaIncidente || payload.fechaReporte || new Date(),
     fecha_regularizado: "",
   };
+}
+
+function normalizarNumeroReporte(valor, decimales) {
+  const numero = numeroDesdeValor(valor);
+  if (!numero) return "";
+  return Number(numero.toFixed(decimales));
+}
+
+function numeroDesdeValor(valor) {
+  if (valor instanceof Date) {
+    return valor.getDate() + ((valor.getMonth() + 1) / 100);
+  }
+  if (typeof valor === "number") return isFinite(valor) ? valor : 0;
+  const raw = String(valor || "").trim().replace(/[^\d,.-]/g, "");
+  if (!raw) return 0;
+  let normalized = raw;
+  if (raw.indexOf(",") !== -1 && raw.indexOf(".") !== -1) {
+    normalized = raw.lastIndexOf(",") > raw.lastIndexOf(".")
+      ? raw.replace(/\./g, "").replace(",", ".")
+      : raw.replace(/,/g, "");
+  } else if (raw.indexOf(",") !== -1) {
+    normalized = raw.replace(",", ".");
+  }
+  const parsed = Number(normalized);
+  return isFinite(parsed) ? parsed : 0;
 }
 
 function getSheet() {
