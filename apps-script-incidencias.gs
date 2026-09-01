@@ -215,7 +215,6 @@ function getSheet() {
   let sheet = spreadsheet.getSheetByName(SHEET_NAME) || spreadsheet.insertSheet(SHEET_NAME);
   ensureHeaders(sheet);
   removeExtraColumns(sheet);
-  removeInvalidRows(sheet);
   formatSheet(sheet);
   return sheet;
 }
@@ -236,23 +235,34 @@ function ensureHeaders(sheet) {
   const lastColumn = Math.max(sheet.getLastColumn(), HEADERS.length);
   const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
   const oldHeaders = values[0].map(String);
-  const oldRows = values.slice(1).filter((row) => row.some((cell) => cell !== ""));
+  const oldRows = values.slice(1);
   const migrated = oldRows.map((row) => {
     const record = {};
     oldHeaders.forEach((header, index) => {
       if (header) record[header] = row[index];
     });
+    repararFilaConColumnasAuxiliares(record);
     if (!record.id) record.id = Utilities.getUuid();
     if (!record.estado) record.estado = "Pendiente";
     if (!record.fecha_incidente) record.fecha_incidente = "";
     if (!record.fecha_regularizado) record.fecha_regularizado = "";
     return HEADERS.map((header) => record[header] ?? "");
   });
-  sheet.clear();
-  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
-  if (migrated.length) {
-    sheet.getRange(2, 1, migrated.length, HEADERS.length).setValues(migrated);
-  }
+  sheet.getRange(1, 1, migrated.length + 1, HEADERS.length).setValues([HEADERS].concat(migrated));
+}
+
+function repararFilaConColumnasAuxiliares(record) {
+  const posibleEstado = String(record.costo_unitario || "").trim();
+  const posibleFechaIncidente = record.unidades_faltantes;
+  const posibleFechaRegularizado = record.estado;
+  const posibleId = String(record.fecha_incidente || "").trim();
+  const tieneEstadoCorrido = posibleEstado === "Pendiente" || posibleEstado === "Regularizado";
+  const tieneIdEnFecha = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(posibleId);
+  if (!tieneEstadoCorrido || !tieneIdEnFecha) return;
+  record.estado = posibleEstado;
+  record.fecha_incidente = posibleFechaIncidente || "";
+  record.fecha_regularizado = posibleFechaRegularizado || "";
+  record.id = posibleId;
 }
 
 function asegurarIds(sheet) {
@@ -290,21 +300,6 @@ function removeExtraColumns(sheet) {
   const extra = sheet.getMaxColumns() - HEADERS.length;
   if (extra > 0) {
     sheet.deleteColumns(HEADERS.length + 1, extra);
-  }
-}
-
-function removeInvalidRows(sheet) {
-  const lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return;
-  const values = sheet.getRange(2, 1, lastRow - 1, HEADERS.length).getValues();
-  for (let index = values.length - 1; index >= 0; index -= 1) {
-    const row = values[index];
-    const required = row.slice(0, 6).concat(row.slice(7, 8));
-    const hasRequired = required.every((cell) => String(cell).trim() !== "");
-    const hasValidBultos = Number(String(row[5]).replace(",", ".")) > 0;
-    if (!hasRequired || !hasValidBultos) {
-      sheet.deleteRow(index + 2);
-    }
   }
 }
 

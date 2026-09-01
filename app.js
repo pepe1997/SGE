@@ -7,7 +7,7 @@ const SHEETS = {
   cargo: "CARGA",
 };
 const REPORT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1EBG_HWQ3lp4UWjPtpMgc0UMe_mH53RWtgAtnDMCQ_nc/edit";
-const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbzaflhCFckAHpTg34s4FVXpZHsrRzIV8cFrZOV0nZo01kQB5nYDViyfk6l0armcPjm2/exec";
+const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbwn62rmKB0CTe8f8stodQQXro1lX1IAM-nVpL7ZXfnkEJ3wRH3_LqadETgQuy0eodpD/exec";
 const REPORT_REFRESH_MS = 3000;
 const STORAGE_KEYS = {
   session: "palletValidator.session",
@@ -823,8 +823,6 @@ async function reportIncident(row, missingBultosValue) {
   const expectedBultos = bultos(row);
   const missing = Math.max(0, toNumber(missingBultosValue));
   const incidentPrice = missingPrice(row, missing);
-  const incidentUnits = missingUnits(row, missing);
-  const incidentUnitCost = unitCost(row);
   const rowTotalPrice = totalPrice(row);
 
   if (!missing) {
@@ -852,8 +850,6 @@ async function reportIncident(row, missingBultosValue) {
     descripcion: row["Descrip ArtÃ­c"] || "",
     bultos: missing.toFixed(2),
     precio: incidentPrice.toFixed(2),
-    costo_unitario: incidentUnitCost.toFixed(4),
-    unidades_faltantes: incidentUnits.toFixed(2),
     estado: "Pendiente",
   };
 
