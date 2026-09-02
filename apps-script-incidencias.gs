@@ -1,5 +1,6 @@
 const SPREADSHEET_ID = "1EBG_HWQ3lp4UWjPtpMgc0UMe_mH53RWtgAtnDMCQ_nc";
 const SHEET_NAME = "Incidencias";
+const IMPACT_SHEET_NAME = "Impacto_Turnos";
 const HEADERS = [
   "tienda",
   "pallet",
@@ -11,6 +12,26 @@ const HEADERS = [
   "estado",
   "fecha_incidente",
   "fecha_regularizado",
+  "id",
+];
+const IMPACT_HEADERS = [
+  "fecha",
+  "turno",
+  "pallets_enviados",
+  "costo_despachado",
+  "incidencias",
+  "bultos_faltantes",
+  "costo_incidencias_bruto",
+  "costo_regularizado",
+  "costo_incidencias_neto",
+  "pallets_con_incidencia",
+  "pallets_incidencia_enviados",
+  "pallets_incidencia_cd",
+  "costo_incidencias_enviadas_neto",
+  "costo_incidencias_cd_neto",
+  "porcentaje_impacto",
+  "nivel_impacto",
+  "fecha_calculo",
   "id",
 ];
 
@@ -33,6 +54,9 @@ function doPost(e) {
     if (payload.action === "deleteIncidents") {
       return jsonResponse({ ok: true, deleted: eliminarIncidencias(payload.ids) });
     }
+    if (payload.action === "saveImpact") {
+      return jsonResponse({ ok: true, saved: guardarImpactoTurnos(payload.rows) });
+    }
 
     const record = guardarIncidencia(payload);
     return jsonResponse({ ok: true, record });
@@ -54,6 +78,11 @@ function doGet(e) {
         ok: true,
         rows: listarIncidencias(),
       };
+    } else if (action === "listImpact") {
+      payload = {
+        ok: true,
+        rows: listarImpactoTurnos(),
+      };
     } else if (action === "create") {
       if (!lock.tryLock(5000)) throw new Error("Sistema ocupado, intenta nuevamente.");
       payload = {
@@ -67,6 +96,9 @@ function doGet(e) {
     } else if (action === "deleteIncidents") {
       if (!lock.tryLock(5000)) throw new Error("Sistema ocupado, intenta nuevamente.");
       payload = { ok: true, deleted: eliminarIncidencias(e.parameter.ids || e.parameter.id) };
+    } else if (action === "saveImpact") {
+      if (!lock.tryLock(5000)) throw new Error("Sistema ocupado, intenta nuevamente.");
+      payload = { ok: true, saved: guardarImpactoTurnos(e.parameter.rows) };
     } else if (action === "health" || action === "setup") {
       payload = estadoServicio();
     } else {
@@ -152,6 +184,55 @@ function listarIncidencias() {
   }).reverse();
 }
 
+function listarImpactoTurnos() {
+  const sheet = getImpactSheet();
+  const values = sheet.getDataRange().getValues();
+  if (values.length <= 1) return [];
+  const headers = values[0];
+  return values.slice(1).filter((row) => row.some((cell) => cell !== "")).map((row) => {
+    const record = {};
+    headers.forEach((header, index) => {
+      const value = row[index];
+      if (["pallets_enviados", "costo_despachado", "incidencias", "bultos_faltantes", "costo_incidencias_bruto", "costo_regularizado", "costo_incidencias_neto", "pallets_con_incidencia", "pallets_incidencia_enviados", "pallets_incidencia_cd", "costo_incidencias_enviadas_neto", "costo_incidencias_cd_neto", "porcentaje_impacto"].indexOf(header) >= 0) {
+        record[header] = normalizarNumeroReporteConCero(value, header === "porcentaje_impacto" ? 4 : 2);
+      } else {
+        record[header] = value instanceof Date ? value.toLocaleString("es-PE") : value;
+      }
+    });
+    return record;
+  }).reverse();
+}
+
+function guardarImpactoTurnos(rowsInput) {
+  const rows = normalizarImpactRows(rowsInput);
+  if (!rows.length) throw new Error("No hay filas de impacto para guardar");
+  const sheet = getImpactSheet();
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0];
+  const fechaIndex = headers.indexOf("fecha");
+  const turnoIndex = headers.indexOf("turno");
+  let saved = 0;
+  rows.forEach((payload) => {
+    const record = normalizarImpactoTurno(payload);
+    let targetRow = -1;
+    for (let i = 1; i < values.length; i += 1) {
+      if (fechaImpactoKey(values[i][fechaIndex]) === fechaImpactoKey(record.fecha) && String(values[i][turnoIndex]) === String(record.turno)) {
+        targetRow = i + 1;
+        break;
+      }
+    }
+    const rowValues = IMPACT_HEADERS.map((header) => record[header] ?? "");
+    if (targetRow > 0) {
+      sheet.getRange(targetRow, 1, 1, IMPACT_HEADERS.length).setValues([rowValues]);
+    } else {
+      sheet.appendRow(rowValues);
+    }
+    saved += 1;
+  });
+  formatImpactSheet(sheet);
+  return saved;
+}
+
 function actualizarEstado(id, estado) {
   if (!id) throw new Error("Falta id");
   const sheet = getSheet();
@@ -223,9 +304,60 @@ function normalizarIncidencia(payload) {
   };
 }
 
+function normalizarImpactRows(rowsInput) {
+  if (Array.isArray(rowsInput)) return rowsInput;
+  const raw = String(rowsInput || "").trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function fechaImpactoKey(value) {
+  if (value instanceof Date) {
+    return [
+      value.getFullYear(),
+      String(value.getMonth() + 1).padStart(2, "0"),
+      String(value.getDate()).padStart(2, "0"),
+    ].join("-");
+  }
+  return String(value || "").trim();
+}
+
+function normalizarImpactoTurno(payload) {
+  return {
+    fecha: payload.fecha || "",
+    turno: payload.turno || "",
+    pallets_enviados: normalizarNumeroReporteConCero(payload.pallets_enviados ?? payload.palletsEnviados ?? "", 2),
+    costo_despachado: normalizarNumeroReporteConCero(payload.costo_despachado ?? payload.costoDespachado ?? "", 2),
+    incidencias: normalizarNumeroReporteConCero(payload.incidencias ?? "", 2),
+    bultos_faltantes: normalizarNumeroReporteConCero(payload.bultos_faltantes ?? payload.bultosFaltantes ?? "", 2),
+    costo_incidencias_bruto: normalizarNumeroReporteConCero(payload.costo_incidencias_bruto ?? payload.costoIncidenciasBruto ?? "", 2),
+    costo_regularizado: normalizarNumeroReporteConCero(payload.costo_regularizado ?? payload.costoRegularizado ?? "", 2),
+    costo_incidencias_neto: normalizarNumeroReporteConCero(payload.costo_incidencias_neto ?? payload.costoIncidenciasNeto ?? "", 2),
+    pallets_con_incidencia: normalizarNumeroReporteConCero(payload.pallets_con_incidencia ?? payload.palletsConIncidencia ?? "", 2),
+    pallets_incidencia_enviados: normalizarNumeroReporteConCero(payload.pallets_incidencia_enviados ?? payload.palletsIncidenciaEnviados ?? "", 2),
+    pallets_incidencia_cd: normalizarNumeroReporteConCero(payload.pallets_incidencia_cd ?? payload.palletsIncidenciaCd ?? "", 2),
+    costo_incidencias_enviadas_neto: normalizarNumeroReporteConCero(payload.costo_incidencias_enviadas_neto ?? payload.costoIncidenciasEnviadasNeto ?? "", 2),
+    costo_incidencias_cd_neto: normalizarNumeroReporteConCero(payload.costo_incidencias_cd_neto ?? payload.costoIncidenciasCdNeto ?? "", 2),
+    porcentaje_impacto: normalizarNumeroReporteConCero(payload.porcentaje_impacto ?? payload.porcentajeImpacto ?? "", 4),
+    nivel_impacto: payload.nivel_impacto || payload.nivelImpacto || "",
+    fecha_calculo: payload.fecha_calculo || payload.fechaCalculo || new Date(),
+    id: payload.id || Utilities.getUuid(),
+  };
+}
+
 function normalizarNumeroReporte(valor, decimales) {
   const numero = numeroDesdeValor(valor);
   if (!numero) return "";
+  return Number(numero.toFixed(decimales));
+}
+
+function normalizarNumeroReporteConCero(valor, decimales) {
+  const numero = numeroDesdeValor(valor);
   return Number(numero.toFixed(decimales));
 }
 
@@ -254,6 +386,14 @@ function getSheet() {
   ensureHeaders(sheet);
   removeExtraColumns(sheet);
   formatSheet(sheet);
+  return sheet;
+}
+
+function getImpactSheet() {
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  let sheet = spreadsheet.getSheetByName(IMPACT_SHEET_NAME) || spreadsheet.insertSheet(IMPACT_SHEET_NAME);
+  ensureImpactHeaders(sheet);
+  formatImpactSheet(sheet);
   return sheet;
 }
 
@@ -341,6 +481,29 @@ function removeExtraColumns(sheet) {
   }
 }
 
+function ensureImpactHeaders(sheet) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(IMPACT_HEADERS);
+    return;
+  }
+  const lastColumn = Math.max(sheet.getLastColumn(), IMPACT_HEADERS.length);
+  const existing = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const ok = IMPACT_HEADERS.every((header, index) => existing[index] === header);
+  if (ok) return;
+  const lastRow = sheet.getLastRow();
+  const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
+  const oldHeaders = values[0].map(String);
+  const migrated = values.slice(1).map((row) => {
+    const record = {};
+    oldHeaders.forEach((header, index) => {
+      if (header) record[header] = row[index];
+    });
+    if (!record.id) record.id = Utilities.getUuid();
+    return IMPACT_HEADERS.map((header) => record[header] ?? "");
+  });
+  sheet.getRange(1, 1, migrated.length + 1, IMPACT_HEADERS.length).setValues([IMPACT_HEADERS].concat(migrated));
+}
+
 function formatSheet(sheet) {
   sheet.showColumns(1, HEADERS.length);
   sheet.setFrozenRows(1);
@@ -360,6 +523,22 @@ function formatSheet(sheet) {
   sheet.setColumnWidth(10, 170);
   sheet.setColumnWidth(11, 1);
   sheet.hideColumns(11);
+}
+
+function formatImpactSheet(sheet) {
+  sheet.showColumns(1, IMPACT_HEADERS.length);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, IMPACT_HEADERS.length)
+    .setFontWeight("bold")
+    .setBackground("#e9f1ec")
+    .setFontColor("#17221b");
+  sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), 1).setNumberFormat("@");
+  sheet.getRange(2, 3, Math.max(sheet.getMaxRows() - 1, 1), 13).setNumberFormat("0.00");
+  sheet.getRange(2, 15, Math.max(sheet.getMaxRows() - 1, 1), 1).setNumberFormat("0.0000");
+  [1, 2, 16, 17].forEach((column) => sheet.setColumnWidth(column, 140));
+  [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].forEach((column) => sheet.setColumnWidth(column, 150));
+  sheet.setColumnWidth(IMPACT_HEADERS.length, 1);
+  sheet.hideColumns(IMPACT_HEADERS.length);
 }
 
 function jsonResponse(payload) {

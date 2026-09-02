@@ -7,7 +7,7 @@ const SHEETS = {
   cargo: "CARGA",
 };
 const REPORT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1EBG_HWQ3lp4UWjPtpMgc0UMe_mH53RWtgAtnDMCQ_nc/edit";
-const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbz2CA6XgPM2z2wAaS5F4kIbNNSZEzn_5SYVphGXGgDKdsppz2YWlIu6KCmdFRrh376z/exec";
+const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbxhIP_3ELlWmKtmvOK7o7I_vdCqEpH2OeR8ObOImeSbvaB_yrQi3Z9qQHtNjNasc221/exec";
 const REPORT_REFRESH_MS = 3000;
 const STORAGE_KEYS = {
   session: "palletValidator.session",
@@ -41,13 +41,16 @@ const state = {
   reportStatus: "idle",
   sentStatus: "idle",
   cargoStatus: "idle",
+  impactStatus: "idle",
   error: "",
   reportError: "",
   sentError: "",
   cargoError: "",
+  impactError: "",
   incidents: [],
   sentRows: [],
   cargoRows: [],
+  impactHistory: [],
   supervisorView: localStorage.getItem(STORAGE_KEYS.supervisorView) || "",
   reportModule: "summary",
   dashboardTurn: "todos",
@@ -66,6 +69,8 @@ const state = {
   sentStore: "todos",
   sentStatusFilter: "todos",
   sentDetailKey: "",
+  impactDate: "",
+  impactSaving: false,
   selectedIncidentIds: new Set(),
   validatorView: localStorage.getItem(STORAGE_KEYS.validatorView) || "",
   validations: loadValidations(),
@@ -310,8 +315,12 @@ function loadReportViaJsonp() {
   return callReportApi("list").then((payload) => payload.rows || []);
 }
 
+function loadImpactHistoryViaJsonp() {
+  return callReportApi("listImpact").then((payload) => payload.rows || []);
+}
+
 function callReportApi(action, params = {}) {
-  if (action === "create" || action === "updateStatus" || action === "deleteIncidents") {
+  if (action === "create" || action === "updateStatus" || action === "deleteIncidents" || action === "saveImpact") {
     return callReportApiPost(action, params).catch(() => callReportApiJsonp(action, params));
   }
   return callReportApiJsonp(action, params);
@@ -399,6 +408,8 @@ async function loadReportIncidents(options = {}) {
       loadReportViaJsonp(),
       canViewSupervisorReport() ? loadSentRows({ silent: true }) : Promise.resolve(),
       canViewSupervisorReport() ? loadCargoRows({ silent: true }) : Promise.resolve(),
+      canViewSupervisorReport() ? loadOperationalRows({ silent: true }) : Promise.resolve(),
+      canViewSupervisorReport() ? loadImpactHistory({ silent: true }) : Promise.resolve(),
     ]);
     const nextIncidents = remoteRows.map(normalizeIncidentForExport).filter(isCleanIncident);
     const nextSignature = JSON.stringify(nextIncidents);
@@ -424,6 +435,43 @@ async function loadReportIncidents(options = {}) {
     toast("No se pudo refrescar el reporte.");
   }
   render();
+}
+
+async function loadOperationalRows(options = {}) {
+  const force = Boolean(options.force);
+  if (!force && state.rows.length && state.productCosts.size) return;
+  try {
+    const [cartonRows, productRows] = await Promise.all([
+      loadSheetRows(SHEETS.cartons),
+      loadSheetRows(SHEETS.products),
+    ]);
+    state.productCosts = buildProductCosts(productRows);
+    state.rows = cartonRows
+      .filter((row) => row.Codigo || row["Nro LPN"] || row["Nro Pallet"])
+      .map((row) => ({
+        ...row,
+        _costoUnidad: state.productCosts.get(normalize(row.Codigo)) || 0,
+      }));
+    state.groupCacheMode = "";
+    state.groupCache = [];
+  } catch (error) {
+    if (!options.silent) throw error;
+  }
+}
+
+async function loadImpactHistory(options = {}) {
+  const silent = Boolean(options.silent);
+  if (!canViewSupervisorReport()) return;
+  state.impactStatus = silent ? state.impactStatus : "loading";
+  state.impactError = "";
+  try {
+    state.impactHistory = (await loadImpactHistoryViaJsonp()).map(normalizeImpactHistoryRow);
+    state.impactStatus = "ready";
+  } catch (error) {
+    state.impactStatus = "error";
+    state.impactError = "No se pudo leer el historico de impacto en este momento.";
+    if (!silent) toast("No se pudo leer Impacto_Turnos.");
+  }
 }
 
 function startReportAutoRefresh() {
@@ -570,17 +618,7 @@ async function loadData() {
   state.tableQuery = "";
   render();
   try {
-    const [cartonRows, productRows] = await Promise.all([
-      loadSheetRows(SHEETS.cartons),
-      loadSheetRows(SHEETS.products),
-    ]);
-    state.productCosts = buildProductCosts(productRows);
-    state.rows = cartonRows
-      .filter((row) => row.Codigo || row["Nro LPN"] || row["Nro Pallet"])
-      .map((row) => ({
-        ...row,
-        _costoUnidad: state.productCosts.get(normalize(row.Codigo)) || 0,
-      }));
+    await loadOperationalRows({ force: true });
     state.status = "ready";
     state.selectedKey = "";
     state.groupCacheMode = "";
@@ -1271,6 +1309,7 @@ function renderGroup(group) {
   const consolidatedRows = consolidateProductRows(group.rows, group.mode === "pallet" ? "pallet" : "lpn");
   const consolidatedUnits = consolidatedRows.reduce((sum, row) => sum + toNumber(row.UnAct), 0);
   const consolidatedBultos = consolidatedRows.reduce((sum, row) => sum + bultos(row), 0);
+  const consolidatedCost = consolidatedRows.reduce((sum, row) => sum + totalPrice(row), 0);
   const destinos = [...new Set(group.rows.map((row) => normalize(row.Destino)).filter(Boolean))];
   const destinoLabel = destinos.length ? destinos.slice(0, 4).join(", ") : "Sin destino";
 
@@ -1278,9 +1317,10 @@ function renderGroup(group) {
     <div class="hero-strip">
       <div>
         <h2>${escapeHtml(group.mode === "lpn" ? "LPN" : group.mode === "codigo" ? "Producto" : "Pallet")} ${escapeHtml(group.key)}</h2>
-        <p class="muted">Destino ${escapeHtml(destinoLabel)} · ${group.pallets.length} pallet · ${group.lpns.length} LPN · ${consolidatedRows.length} productos · ${consolidatedUnits} unidades · ${consolidatedBultos.toFixed(2)} cartones</p>
+        <p class="muted">Destino ${escapeHtml(destinoLabel)} · ${group.pallets.length} pallet · ${group.lpns.length} LPN · ${consolidatedRows.length} productos · ${consolidatedUnits} unidades · ${consolidatedBultos.toFixed(2)} cartones · Total S/ ${money(consolidatedCost)}</p>
         <div class="chips">
           <span class="chip">Destino ${escapeHtml(destinoLabel)}</span>
+          <span class="chip">Total S/ ${money(consolidatedCost)}</span>
           ${group.pallets.map((item) => `<span class="chip">Pallet ${escapeHtml(item)}</span>`).join("")}
           ${group.lpns.slice(0, 8).map((item) => `<span class="chip">LPN ${escapeHtml(item)}</span>`).join("")}
           ${group.lpns.length > 8 ? `<span class="chip">+${group.lpns.length - 8} LPN</span>` : ""}
@@ -1550,6 +1590,197 @@ function turnLabel(turn) {
   }[turn] || "Todos";
 }
 
+function impactTurn(date) {
+  if (!date) return "sin_fecha";
+  const hour = date.getHours();
+  return hour >= 7 && hour < 19 ? "dia" : "noche";
+}
+
+function impactLevel(percent) {
+  if (percent >= 2) return "Alto";
+  if (percent >= 1) return "Medio";
+  return "Bajo";
+}
+
+function normalizeImpactHistoryRow(row) {
+  return {
+    fecha: row.fecha || "",
+    turno: row.turno || "",
+    pallets_enviados: toNumber(row.pallets_enviados),
+    costo_despachado: toNumber(row.costo_despachado),
+    incidencias: toNumber(row.incidencias),
+    bultos_faltantes: toNumber(row.bultos_faltantes),
+    costo_incidencias_bruto: toNumber(row.costo_incidencias_bruto),
+    costo_regularizado: toNumber(row.costo_regularizado),
+    costo_incidencias_neto: toNumber(row.costo_incidencias_neto),
+    pallets_con_incidencia: toNumber(row.pallets_con_incidencia),
+    pallets_incidencia_enviados: toNumber(row.pallets_incidencia_enviados),
+    pallets_incidencia_cd: toNumber(row.pallets_incidencia_cd),
+    costo_incidencias_enviadas_neto: toNumber(row.costo_incidencias_enviadas_neto),
+    costo_incidencias_cd_neto: toNumber(row.costo_incidencias_cd_neto),
+    porcentaje_impacto: toNumber(row.porcentaje_impacto),
+    nivel_impacto: row.nivel_impacto || "",
+    fecha_calculo: row.fecha_calculo || "",
+    id: row.id || "",
+  };
+}
+
+function shipmentDate(shipment) {
+  return parseIncidentDate(shipment?.fechaDespacho) || parseIncidentDate(shipment?.hora);
+}
+
+function sentLineCode(row) {
+  return normalize(field(row.raw || row, ["Codigo", "Código", "Cod Barra", "Cod. Barra", "CodBarra", "CODIGO", "COD BARRA"]));
+}
+
+function sentLineUnits(row) {
+  return toNumber(field(row.raw || row, ["UnAct", "UN ACT", "Un Act", "Unidades", "UNIDADES", "Qty", "QTY"]));
+}
+
+function sentLineBultos(row) {
+  const raw = row.raw || row;
+  const explicitBultos = toNumber(field(raw, ["Bultos", "BULTOS", "QtyAsgn Cases", "Cases"]));
+  if (explicitBultos > 0) return explicitBultos;
+  const units = sentLineUnits(row);
+  const unitsPerBox = toNumber(field(raw, ["Und x Caja", "UND X CAJA", "Und Caja", "UxC"]));
+  return unitsPerBox > 0 ? units / unitsPerBox : units;
+}
+
+function sentLineCost(row) {
+  const code = sentLineCode(row);
+  const units = sentLineUnits(row);
+  const cost = toNumber(state.productCosts.get(code));
+  return units * cost;
+}
+
+function impactRowsForDate(dateValue) {
+  const selectedDate = dateValue || dateInputValue(new Date());
+  const cargos = cargoMap();
+  const sentMap = sentPalletMap();
+  const sentByTurn = {
+    dia: { pallets: new Map(), missingCostPallets: new Set(), costo: 0, bultos: 0 },
+    noche: { pallets: new Map(), missingCostPallets: new Set(), costo: 0, bultos: 0 },
+  };
+
+  state.sentRows.forEach((row) => {
+    const shipment = enrichShipmentWithCargo(row, cargos);
+    const date = shipmentDate(shipment);
+    if (dateInputValue(date) !== selectedDate) return;
+    const turn = impactTurn(date);
+    if (!sentByTurn[turn]) return;
+    const pallet = palletKey(shipment.pallet);
+    if (!pallet) return;
+    if (!sentByTurn[turn].pallets.has(pallet)) sentByTurn[turn].pallets.set(pallet, shipment);
+    const lineCost = sentLineCost(row);
+    sentByTurn[turn].costo += lineCost;
+    sentByTurn[turn].bultos += sentLineBultos(row);
+    if (lineCost <= 0) sentByTurn[turn].missingCostPallets.add(pallet);
+  });
+
+  const incidentsByTurn = {
+    dia: { rows: [], sentRows: [], cdRows: [], bruto: 0, regularizado: 0, neto: 0, enviadoNeto: 0, cdNeto: 0, bultos: 0, pallets: new Set(), sentPallets: new Set(), cdPallets: new Set() },
+    noche: { rows: [], sentRows: [], cdRows: [], bruto: 0, regularizado: 0, neto: 0, enviadoNeto: 0, cdNeto: 0, bultos: 0, pallets: new Set(), sentPallets: new Set(), cdPallets: new Set() },
+  };
+
+  allDashboardRows().forEach((row) => {
+    if (dateInputValue(row._date) !== selectedDate) return;
+    const turn = impactTurn(row._date);
+    if (!incidentsByTurn[turn]) return;
+    const incident = incidentsByTurn[turn];
+    const pallet = palletKey(row.pallet);
+    const matches = (sentMap.get(pallet) || []).map((shipment) => enrichShipmentWithCargo(shipment, cargos));
+    const shipment = matches[0] || null;
+    const isSent = Boolean(shipment);
+    const enriched = {
+      ...row,
+      _sent: isSent,
+      _shipment: shipment,
+    };
+    incident.rows.push(enriched);
+    incident.bruto += row._precio;
+    incident.bultos += row._bultos;
+    if (pallet) incident.pallets.add(pallet);
+    if (row.estado === "Regularizado") {
+      incident.regularizado += row._precio;
+    } else {
+      incident.neto += row._precio;
+      if (isSent) {
+        incident.sentRows.push(enriched);
+        incident.enviadoNeto += row._precio;
+        if (pallet) incident.sentPallets.add(pallet);
+      } else {
+        incident.cdRows.push(enriched);
+        incident.cdNeto += row._precio;
+        if (pallet) incident.cdPallets.add(pallet);
+      }
+    }
+  });
+
+  return ["dia", "noche"].map((turn) => {
+    const sent = sentByTurn[turn];
+    const incidents = incidentsByTurn[turn];
+    const percent = sent.costo > 0 ? (incidents.neto / sent.costo) * 100 : 0;
+    return {
+      fecha: selectedDate,
+      turno: turnLabel(turn),
+      turnKey: turn,
+      pallets_enviados: sent.pallets.size,
+      costo_despachado: sent.costo,
+      bultos_despachados: sent.bultos,
+      pallets_sin_costo: sent.missingCostPallets.size,
+      pallets_con_incidencia: incidents.pallets.size,
+      pallets_incidencia_enviados: incidents.sentPallets.size,
+      pallets_incidencia_cd: incidents.cdPallets.size,
+      incidencias: incidents.rows.length,
+      bultos_faltantes: incidents.bultos,
+      costo_incidencias_bruto: incidents.bruto,
+      costo_regularizado: incidents.regularizado,
+      costo_incidencias_neto: incidents.neto,
+      costo_incidencias_enviadas_neto: incidents.enviadoNeto,
+      costo_incidencias_cd_neto: incidents.cdNeto,
+      porcentaje_impacto: percent,
+      nivel_impacto: impactLevel(percent),
+      incidentRows: incidents.rows,
+    };
+  });
+}
+
+async function saveImpactSnapshot() {
+  if (!canManageIncidents()) return;
+  const rows = impactRowsForDate(state.impactDate || dateInputValue(new Date()));
+  state.impactSaving = true;
+  render();
+  try {
+    const payloadRows = rows.map((row) => ({
+      fecha: row.fecha,
+      turno: row.turno,
+      pallets_enviados: row.pallets_enviados,
+      costo_despachado: row.costo_despachado.toFixed(2),
+      incidencias: row.incidencias,
+      bultos_faltantes: row.bultos_faltantes.toFixed(2),
+      costo_incidencias_bruto: row.costo_incidencias_bruto.toFixed(2),
+      costo_regularizado: row.costo_regularizado.toFixed(2),
+      costo_incidencias_neto: row.costo_incidencias_neto.toFixed(2),
+      pallets_con_incidencia: row.pallets_con_incidencia,
+      pallets_incidencia_enviados: row.pallets_incidencia_enviados,
+      pallets_incidencia_cd: row.pallets_incidencia_cd,
+      costo_incidencias_enviadas_neto: row.costo_incidencias_enviadas_neto.toFixed(2),
+      costo_incidencias_cd_neto: row.costo_incidencias_cd_neto.toFixed(2),
+      porcentaje_impacto: row.porcentaje_impacto.toFixed(4),
+      nivel_impacto: row.nivel_impacto,
+      fecha_calculo: new Date().toLocaleString("es-PE"),
+    }));
+    const response = await callReportApi("saveImpact", { rows: JSON.stringify(payloadRows) });
+    toast(`Historico actualizado: ${response.saved || payloadRows.length} turnos.`);
+    await loadImpactHistory({ silent: true });
+  } catch (error) {
+    toast("No se pudo guardar el historico de impacto.");
+  } finally {
+    state.impactSaving = false;
+    render();
+  }
+}
+
 function palletKey(value) {
   return normalize(value).toUpperCase().replace(/\s+/g, "");
 }
@@ -1564,6 +1795,12 @@ function normalizeSentRow(row) {
     "FECHA DESPACHO",
     "Fecha Despacho",
     "FECHA_DESPACHO",
+    "LPN Fe Y Hr Modif",
+    "LPN Fe y Hr Modif",
+    "Hora de asignación de carga",
+    "Hora de asignacion de carga",
+    "Fe Hr Packing",
+    "Fe Hr Crea Asign",
     "Fecha",
     "FECHA",
   ]);
@@ -1654,7 +1891,7 @@ function dashboardRows() {
         _date: date,
         _turn: incidentTurn(date),
         _bultos: toNumber(incident.bultos),
-        _precio: toNumber(incident.precio),
+        _precio: priceToNumber(incident.precio),
       };
     })
     .filter((incident) => state.dashboardTurn === "todos" || incident._turn === state.dashboardTurn);
@@ -1672,7 +1909,7 @@ function allDashboardRows() {
         _regularizedDate: parseIncidentDate(incident.fecha_regularizado),
         _turn: incidentTurn(date),
         _bultos: toNumber(incident.bultos),
-        _precio: toNumber(incident.precio),
+        _precio: priceToNumber(incident.precio),
       };
     });
 }
@@ -1764,6 +2001,48 @@ function trendByHour(rows) {
       time: hour,
     };
   }).filter((point) => point.bultos > 0 || point.count > 0);
+}
+
+function impactTrendByDate(selectedDate, currentRows) {
+  const map = new Map();
+  state.impactHistory.forEach((row) => {
+    if (!row.fecha) return;
+    const current = map.get(row.fecha) || {
+      key: row.fecha,
+      time: parseIncidentDate(row.fecha)?.getTime() || 0,
+      dispatch: 0,
+      net: 0,
+      count: 0,
+      bultos: 0,
+    };
+    current.dispatch += row.costo_despachado;
+    current.net += row.costo_incidencias_neto;
+    current.count += row.incidencias;
+    current.bultos += row.bultos_faltantes;
+    map.set(row.fecha, current);
+  });
+
+  if (selectedDate) {
+    const dispatch = currentRows.reduce((sum, row) => sum + row.costo_despachado, 0);
+    const net = currentRows.reduce((sum, row) => sum + row.costo_incidencias_neto, 0);
+    map.set(selectedDate, {
+      key: selectedDate,
+      time: parseIncidentDate(selectedDate)?.getTime() || Date.now(),
+      dispatch,
+      net,
+      count: currentRows.reduce((sum, row) => sum + row.incidencias, 0),
+      bultos: currentRows.reduce((sum, row) => sum + row.bultos_faltantes, 0),
+    });
+  }
+
+  return [...map.values()]
+    .map((point) => ({
+      ...point,
+      porcentaje_impacto: point.dispatch ? (point.net / point.dispatch) * 100 : 0,
+    }))
+    .filter((point) => point.dispatch > 0 || point.net > 0 || point.count > 0)
+    .sort((a, b) => a.time - b.time)
+    .slice(-10);
 }
 
 function renderLineChart(points, valueKey = "count", valueLabel = "incidencias") {
@@ -2439,6 +2718,385 @@ function renderRecentIncidents(rows) {
   `;
 }
 
+function renderImpactReport() {
+  const selectedDate = state.impactDate || dateInputValue(new Date());
+  if (!state.impactDate) state.impactDate = selectedDate;
+  const rows = impactRowsForDate(selectedDate);
+  const impactTrend = impactTrendByDate(selectedDate, rows);
+  const totalDispatch = rows.reduce((sum, row) => sum + row.costo_despachado, 0);
+  const totalNetIncidents = rows.reduce((sum, row) => sum + row.costo_incidencias_neto, 0);
+  const totalGrossIncidents = rows.reduce((sum, row) => sum + row.costo_incidencias_bruto, 0);
+  const totalRegularized = rows.reduce((sum, row) => sum + row.costo_regularizado, 0);
+  const totalSentIncidentCost = rows.reduce((sum, row) => sum + row.costo_incidencias_enviadas_neto, 0);
+  const totalCdIncidentCost = rows.reduce((sum, row) => sum + row.costo_incidencias_cd_neto, 0);
+  const totalIncidentPallets = rows.reduce((sum, row) => sum + row.pallets_con_incidencia, 0);
+  const totalSentIncidentPallets = rows.reduce((sum, row) => sum + row.pallets_incidencia_enviados, 0);
+  const totalCdIncidentPallets = rows.reduce((sum, row) => sum + row.pallets_incidencia_cd, 0);
+  const totalImpact = totalDispatch ? (totalNetIncidents / totalDispatch) * 100 : 0;
+  return `
+    <div class="impact-report">
+      ${state.impactStatus === "error" ? `<p class="notice">${escapeHtml(state.impactError)}</p>` : ""}
+      <div class="impact-hero">
+        <div>
+          <span class="eyebrow">Impacto economico por turno</span>
+          <h3>Despacho total vs incidencias</h3>
+          </div>
+        <div class="impact-actions">
+          <label>
+            <span>Fecha</span>
+            <input id="impactDate" type="date" value="${escapeAttr(selectedDate)}" />
+          </label>
+          ${canManageIncidents() ? `<button class="btn warning" id="saveImpactBtn" type="button" ${state.impactSaving ? "disabled" : ""}>${state.impactSaving ? "Guardando..." : "Guardar historico"}</button>` : ""}
+        </div>
+      </div>
+      <div class="dashboard-kpis">
+        <div class="kpi-card"><span>Costo despachado</span><strong>S/ ${money(totalDispatch)}</strong><small>Dia + Noche</small></div>
+        <div class="kpi-card"><span>Incidencias netas</span><strong>S/ ${money(totalNetIncidents)}</strong><small>Pendiente real</small></div>
+        <div class="kpi-card"><span>Regularizado</span><strong>S/ ${money(totalRegularized)}</strong><small>Descontado de impacto</small></div>
+        <div class="kpi-card ${totalImpact >= 2 ? "risk-high" : totalImpact >= 1 ? "risk-mid" : "risk-low"}"><span>% impacto</span><strong>${totalImpact.toFixed(2)}%</strong><small>${escapeHtml(impactLevel(totalImpact))}</small></div>
+      </div>
+      <div class="dashboard-grid">
+        <article class="chart-card wide">
+          <div class="chart-title"><h3>Comparativa del turno</h3><span>Dia / Noche</span></div>
+          <div class="impact-turn-grid">
+            ${rows.map((row) => `
+              <article class="impact-turn-card ${row.nivel_impacto.toLowerCase()}">
+                <div class="bar-head">
+                  <strong>Turno ${escapeHtml(row.turno)}</strong>
+                  <span>${row.porcentaje_impacto.toFixed(2)}%</span>
+                </div>
+                <div class="impact-money">
+                  <div><span>Despachado</span><b>S/ ${money(row.costo_despachado)}</b></div>
+                  <div><span>Incidencia neta</span><b>S/ ${money(row.costo_incidencias_neto)}</b></div>
+                  <div><span>Enviado con incidencia</span><b>S/ ${money(row.costo_incidencias_enviadas_neto)}</b></div>
+                  <div><span>Aun en CD</span><b>S/ ${money(row.costo_incidencias_cd_neto)}</b></div>
+                </div>
+                <div class="bar-track"><span style="width:${Math.min(100, Math.max(3, row.porcentaje_impacto * 25)).toFixed(1)}%"></span></div>
+                <small>${row.pallets_enviados} pallets despachados · ${row.pallets_con_incidencia} pallets con incidencia · ${row.pallets_incidencia_enviados} enviados · ${row.pallets_incidencia_cd} en CD ${row.pallets_sin_costo ? `· ${row.pallets_sin_costo} pallets sin costo` : ""}</small>
+              </article>
+            `).join("")}
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-title"><h3>Tendencia de impacto</h3><span>Por fecha</span></div>
+          ${renderLineChart(impactTrend, "porcentaje_impacto", "% impacto")}
+        </article>
+        <article class="chart-card">
+          <div class="chart-title"><h3>Nivel de impacto</h3><span>Semaforo</span></div>
+          ${renderBars(rows.map((row) => ({
+            key: `Turno ${row.turno}`,
+            count: row.incidencias,
+            bultos: row.bultos_faltantes,
+            precio: row.costo_incidencias_neto,
+          })), Math.max(totalNetIncidents, 1), "precio")}
+        </article>
+        <article class="chart-card">
+          <div class="chart-title"><h3>Salida de incidencias</h3><span>Enviado vs CD</span></div>
+          ${renderImpactLocationChart({
+            sentCost: totalSentIncidentCost,
+            cdCost: totalCdIncidentCost,
+            sentPallets: totalSentIncidentPallets,
+            cdPallets: totalCdIncidentPallets,
+            totalPallets: totalIncidentPallets,
+          })}
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-title"><h3>Detalle del corte</h3><span>Se guarda por fecha y turno</span></div>
+          <div class="sent-table-wrap compact-table">
+            <table class="sent-table">
+              <thead>
+                <tr>
+                  <th>Turno</th>
+                  <th>Pallets enviados</th>
+                  <th>Costo despachado</th>
+                  <th>Incidencias</th>
+                  <th>Enviado / CD</th>
+                  <th>Costo neto</th>
+                  <th>% impacto</th>
+                  <th>Nivel</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows.map((row) => `
+                  <tr>
+                    <td><strong>${escapeHtml(row.turno)}</strong><small>${escapeHtml(row.fecha)}</small></td>
+                    <td>${row.pallets_enviados}<small>${row.pallets_sin_costo ? `${row.pallets_sin_costo} sin costo` : "Costo completo"}</small></td>
+                    <td><strong>S/ ${money(row.costo_despachado)}</strong><small>${row.bultos_despachados.toFixed(2)} bultos</small></td>
+                    <td>${row.incidencias}<small>${row.pallets_con_incidencia} pallets · ${row.bultos_faltantes.toFixed(2)} bultos falt.</small></td>
+                    <td>${row.pallets_incidencia_enviados} / ${row.pallets_incidencia_cd}<small>S/ ${money(row.costo_incidencias_enviadas_neto)} env. · S/ ${money(row.costo_incidencias_cd_neto)} CD</small></td>
+                    <td><strong>S/ ${money(row.costo_incidencias_neto)}</strong><small>Bruto S/ ${money(row.costo_incidencias_bruto)}</small></td>
+                    <td><strong>${row.porcentaje_impacto.toFixed(2)}%</strong></td>
+                    <td><span class="badge ${row.nivel_impacto === "Alto" ? "missing" : "ok"}">${escapeHtml(row.nivel_impacto)}</span></td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        </article>
+        <article class="chart-card wide">
+          <div class="chart-title"><h3>Pallets con incidencia</h3><span>Cruce ENVIADO + CARGA</span></div>
+          ${renderImpactIncidentDetail(rows)}
+        </article>
+      </div>
+    </div>
+  `;
+}
+
+function renderImpactHistoryReport() {
+  return `
+    <div class="impact-report">
+      <div class="impact-hero">
+        <div>
+          <span class="eyebrow">Impacto_Turnos</span>
+          <h3>Dashboard historico</h3>
+        </div>
+      </div>
+      <div class="dashboard-grid">
+        <article class="chart-card wide">
+          ${renderImpactHistoryDashboard(state.impactHistory)}
+        </article>
+      </div>
+    </div>
+  `;
+}
+
+function renderImpactLocationChart(summary) {
+  const total = summary.sentCost + summary.cdCost;
+  const sentPercent = total ? (summary.sentCost / total) * 100 : 0;
+  const cdPercent = total ? (summary.cdCost / total) * 100 : 0;
+  const segments = total
+    ? `#42784f 0% ${sentPercent.toFixed(2)}%, #a83224 ${sentPercent.toFixed(2)}% 100%`
+    : "#e8dccf 0% 100%";
+  return `
+    <div class="impact-location-card">
+      <div class="impact-mini-donut" style="--segments:${segments}">
+        <strong>${summary.totalPallets}</strong>
+        <span>pallets</span>
+      </div>
+      <div class="impact-location-list">
+        <div>
+          <i class="sent"></i>
+          <span>Enviado</span>
+          <strong>S/ ${money(summary.sentCost)}</strong>
+          <small>${summary.sentPallets} pallets · ${sentPercent.toFixed(1)}%</small>
+        </div>
+        <div>
+          <i class="cd"></i>
+          <span>Aun en CD</span>
+          <strong>S/ ${money(summary.cdCost)}</strong>
+          <small>${summary.cdPallets} pallets · ${cdPercent.toFixed(1)}%</small>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function impactHistorySorted(history) {
+  return history
+    .slice()
+    .filter((row) => row.fecha && row.turno)
+    .sort((a, b) => {
+      const dateA = parseIncidentDate(a.fecha)?.getTime() || 0;
+      const dateB = parseIncidentDate(b.fecha)?.getTime() || 0;
+      if (dateA !== dateB) return dateA - dateB;
+      return String(a.turno).localeCompare(String(b.turno));
+    });
+}
+
+function renderImpactHistoryDashboard(history) {
+  const rows = impactHistorySorted(history);
+  if (!rows.length) return `<div class="chart-empty">Aun no hay cortes guardados.</div>`;
+  const recent = rows.slice(-20);
+  const totalDispatch = recent.reduce((sum, row) => sum + row.costo_despachado, 0);
+  const totalNet = recent.reduce((sum, row) => sum + row.costo_incidencias_neto, 0);
+  const totalSent = recent.reduce((sum, row) => sum + row.costo_incidencias_enviadas_neto, 0);
+  const totalCd = recent.reduce((sum, row) => sum + row.costo_incidencias_cd_neto, 0);
+  const weightedImpact = totalDispatch ? (totalNet / totalDispatch) * 100 : 0;
+  const last = recent[recent.length - 1];
+  const highest = recent.reduce((max, row) => row.porcentaje_impacto > max.porcentaje_impacto ? row : max, recent[0]);
+  const turnGroups = ["Dia", "Noche"].map((turn) => {
+    const turnRows = recent.filter((row) => row.turno === turn);
+    const dispatch = turnRows.reduce((sum, row) => sum + row.costo_despachado, 0);
+    const net = turnRows.reduce((sum, row) => sum + row.costo_incidencias_neto, 0);
+    return {
+      key: turn,
+      count: turnRows.reduce((sum, row) => sum + row.incidencias, 0),
+      bultos: turnRows.reduce((sum, row) => sum + row.bultos_faltantes, 0),
+      precio: net,
+      impact: dispatch ? (net / dispatch) * 100 : 0,
+    };
+  });
+  const trend = recent.map((row) => ({
+    key: `${row.fecha} ${row.turno}`,
+    porcentaje_impacto: row.porcentaje_impacto,
+    count: row.incidencias,
+    bultos: row.bultos_faltantes,
+  }));
+
+  return `
+    <div class="impact-history-dashboard">
+      <div class="impact-history-kpis">
+        <div><span>Promedio</span><strong>${weightedImpact.toFixed(2)}%</strong></div>
+        <div><span>Ultimo</span><strong>${last.porcentaje_impacto.toFixed(2)}%</strong></div>
+        <div><span>Pico</span><strong>${highest.porcentaje_impacto.toFixed(2)}%</strong></div>
+        <div><span>Cortes</span><strong>${rows.length}</strong></div>
+      </div>
+      <div class="impact-history-grid">
+        <div class="impact-history-panel trend">
+          <div class="impact-history-label"><strong>Tendencia</strong><span>% impacto</span></div>
+          ${renderLineChart(trend, "porcentaje_impacto", "% impacto")}
+        </div>
+        <div class="impact-history-panel">
+          <div class="impact-history-label"><strong>Impacto por corte</strong><span>ultimos 8</span></div>
+          ${renderImpactDispatchBars(recent)}
+        </div>
+        <div class="impact-history-panel turn-pie">
+          <div class="impact-history-label"><strong>Dia / noche</strong><span>neto</span></div>
+          ${renderImpactTurnSplit(turnGroups)}
+        </div>
+        <div class="impact-history-panel location">
+          <div class="impact-history-label"><strong>Salida</strong><span>enviado / CD</span></div>
+          ${renderImpactHistoryLocationChart({
+            sentCost: totalSent,
+            cdCost: totalCd,
+            sentPallets: recent.reduce((sum, row) => sum + row.pallets_incidencia_enviados, 0),
+            cdPallets: recent.reduce((sum, row) => sum + row.pallets_incidencia_cd, 0),
+            totalPallets: recent.reduce((sum, row) => sum + row.pallets_con_incidencia, 0),
+          })}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderImpactDispatchBars(rows) {
+  const recent = rows.slice(-8);
+  if (!recent.length) return `<div class="chart-empty">Sin historico.</div>`;
+  const maxImpact = Math.max(...recent.map((row) => row.porcentaje_impacto), 0.1);
+  return `
+    <div class="impact-dispatch-bars">
+      ${recent.map((row) => `
+        <div class="impact-dual-bar" title="${escapeHtml(row.fecha)} · ${escapeHtml(row.turno)}">
+          <span>${escapeHtml(row.turno.slice(0, 1))}</span>
+          <strong>${escapeHtml(row.fecha)}</strong>
+          <b>${row.porcentaje_impacto.toFixed(2)}%</b>
+          <div>
+            <i class="incident" style="width:${Math.max(4, (row.porcentaje_impacto / maxImpact) * 100).toFixed(1)}%"></i>
+          </div>
+          <small>S/ ${money(row.costo_incidencias_neto)} inc. · S/ ${money(row.costo_despachado)} desp.</small>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderImpactTurnSplit(items) {
+  const total = items.reduce((sum, item) => sum + item.precio, 0);
+  let accumulated = 0;
+  const colors = ["#e8792e", "#42784f"];
+  const segments = total
+    ? items.map((item, index) => {
+      const start = accumulated;
+      const end = accumulated + (item.precio / total) * 100;
+      accumulated = end;
+      return `${colors[index % colors.length]} ${start.toFixed(2)}% ${end.toFixed(2)}%`;
+    }).join(", ")
+    : "#e8dccf 0% 100%";
+  return `
+    <div class="impact-turn-split">
+      <div class="impact-turn-donut" style="--segments:${segments}">
+        <strong>S/ ${money(total)}</strong>
+        <span>neto</span>
+      </div>
+      <div class="impact-turn-legend">
+        ${items.map((item, index) => `
+          <div>
+            <i style="background:${colors[index % colors.length]}"></i>
+            <span>${escapeHtml(item.key)}</span>
+            <strong>${total ? ((item.precio / total) * 100).toFixed(1) : "0.0"}%</strong>
+            <small>S/ ${money(item.precio)} · ${item.count} inc.</small>
+          </div>
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderImpactHistoryLocationChart(summary) {
+  const total = summary.sentCost + summary.cdCost;
+  const sentPercent = total ? (summary.sentCost / total) * 100 : 0;
+  const cdPercent = total ? (summary.cdCost / total) * 100 : 0;
+  const segments = total
+    ? `#42784f 0% ${sentPercent.toFixed(2)}%, #a83224 ${sentPercent.toFixed(2)}% 100%`
+    : "#e8dccf 0% 100%";
+  return `
+    <div class="impact-history-location">
+      <div class="impact-history-donut" style="--segments:${segments}">
+        <strong>${summary.totalPallets}</strong>
+        <span>pallets</span>
+      </div>
+      <div class="impact-history-location-list">
+        <div>
+          <i class="sent"></i>
+          <span>Enviado</span>
+          <strong>${sentPercent.toFixed(1)}%</strong>
+          <small>S/ ${money(summary.sentCost)} · ${summary.sentPallets} pallets</small>
+        </div>
+        <div>
+          <i class="cd"></i>
+          <span>En CD</span>
+          <strong>${cdPercent.toFixed(1)}%</strong>
+          <small>S/ ${money(summary.cdCost)} · ${summary.cdPallets} pallets</small>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderImpactIncidentDetail(turnRows) {
+  const rows = turnRows.flatMap((turn) => turn.incidentRows.map((row) => ({ ...row, _impactTurn: turn.turno })));
+  if (!rows.length) return `<div class="chart-empty">Sin incidencias para esta fecha.</div>`;
+  return `
+    <div class="sent-table-wrap compact-table">
+      <table class="sent-table">
+        <thead>
+          <tr>
+            <th>Turno</th>
+            <th>Estado envio</th>
+            <th>Pallet / LPN</th>
+            <th>Producto</th>
+            <th>Carga / placa</th>
+            <th>Chofer</th>
+            <th>Costo neto</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .slice()
+            .sort((a, b) => Number(b._sent) - Number(a._sent) || b._precio - a._precio)
+            .slice(0, 80)
+            .map((row) => {
+              const shipment = row._shipment || {};
+              const isRegularized = row.estado === "Regularizado";
+              return `
+                <tr class="${row._sent ? "sent" : "not-sent"}">
+                  <td><strong>${escapeHtml(row._impactTurn)}</strong><small>${escapeHtml(row.fecha_incidente || "")}</small></td>
+                  <td><span class="badge ${row._sent ? "ok" : "missing"}">${row._sent ? "Enviado" : "En CD"}</span></td>
+                  <td><strong>${escapeHtml(row.pallet || "SIN PALLET")}</strong><small>${escapeHtml(row.lpn || "")}</small></td>
+                  <td>${escapeHtml(row.descripcion)}<small>Codigo ${escapeHtml(row.codigos)}</small></td>
+                  <td>${row._sent ? `<strong>${escapeHtml(shipment.carga || "-")}</strong><small>Placa ${escapeHtml(shipment.placa || "-")}</small>` : "-"}</td>
+                  <td>${row._sent ? `${escapeHtml(shipment.chofer || "-")}<small>${escapeHtml(shipment.fechaDespacho || "Sin fecha despacho")}</small>` : "-"}</td>
+                  <td><strong>S/ ${money(isRegularized ? 0 : row._precio)}</strong><small>${escapeHtml(row.estado)} · ${row._bultos.toFixed(2)} bultos</small></td>
+                </tr>
+              `;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 function renderDashboard() {
   const allRows = allDashboardRows();
   const rows = filteredSummaryDashboardRows(allRows);
@@ -2459,13 +3117,29 @@ function renderDashboard() {
       <div class="dashboard-header">
         <div>
           <span class="eyebrow">Dashboard de incidencias</span>
-          <h2>${state.reportModule === "advance" ? "Reporte de avance" : state.reportModule === "sent" ? "Incidencias enviadas" : "Reporte ejecutivo"}</h2>
-          <p class="muted">${rows.length} de ${allRows.length} registros · ${escapeHtml(turnLabel(state.dashboardTurn))}</p>
+          <h2>${
+            state.reportModule === "advance"
+              ? "Reporte de avance"
+              : state.reportModule === "sent"
+                ? "Incidencias enviadas"
+                : state.reportModule === "impact"
+                  ? "Impacto economico"
+                  : state.reportModule === "impactHistory"
+                    ? "Impacto Turnos"
+                    : "Reporte ejecutivo"
+          }</h2>
+          <p class="muted">${
+            state.reportModule === "impactHistory"
+              ? `${state.impactHistory.length} cortes guardados`
+              : `${rows.length} de ${allRows.length} registros · ${escapeHtml(turnLabel(state.dashboardTurn))}`
+          }</p>
         </div>
         <div class="report-module-tabs">
           <button class="tab ${state.reportModule === "summary" ? "active" : ""}" data-report-module="summary">Resumen</button>
           <button class="tab ${state.reportModule === "advance" ? "active" : ""}" data-report-module="advance">Avance</button>
           <button class="tab ${state.reportModule === "sent" ? "active" : ""}" data-report-module="sent">Enviado</button>
+          <button class="tab ${state.reportModule === "impact" ? "active" : ""}" data-report-module="impact">Impacto</button>
+          <button class="tab ${state.reportModule === "impactHistory" ? "active" : ""}" data-report-module="impactHistory">Impacto Turnos</button>
         </div>
       </div>
       ${state.reportStatus === "loading" ? `<p class="notice">Actualizando reporte...</p>` : ""}
@@ -2475,6 +3149,10 @@ function renderDashboard() {
           ? renderAdvanceReport()
           : state.reportModule === "sent"
             ? renderSentIncidentsReport()
+            : state.reportModule === "impact"
+              ? renderImpactReport()
+              : state.reportModule === "impactHistory"
+                ? renderImpactHistoryReport()
           : `
       <div class="summary-filters">
         <label class="span-2">
@@ -2567,7 +3245,7 @@ function renderHistory() {
         </div>
         <div class="quick-actions">
           ${canManageIncidents() ? `<button class="btn danger" id="deleteSelectedBtn">Eliminar seleccionadas</button>` : ""}
-          ${canManageIncidents() ? `<button class="btn ghost" id="refreshReportBtn">Actualizar reporte</button>` : ""}
+          ${canManageIncidents() ? `<button class="btn ghost" id="refreshReportBtn">Actualizar data Google Sheet</button>` : ""}
           <button class="btn warning" id="historyExportBtn">Exportar Excel</button>
         </div>
       </div>
@@ -2741,6 +3419,11 @@ function bindAppEvents(group) {
     render();
   });
   document.querySelector("#sentExportBtn")?.addEventListener("click", exportSentReport);
+  document.querySelector("#impactDate")?.addEventListener("change", (event) => {
+    state.impactDate = event.target.value;
+    render();
+  });
+  document.querySelector("#saveImpactBtn")?.addEventListener("click", saveImpactSnapshot);
   document.querySelectorAll("[data-sent-detail]").forEach((button) => {
     button.addEventListener("click", () => {
       state.sentDetailKey = button.dataset.sentDetail;
