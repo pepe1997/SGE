@@ -70,6 +70,7 @@ const state = {
   sentStatusFilter: "todos",
   sentDetailKey: "",
   impactDate: "",
+  impactHistoryDate: "",
   impactSaving: false,
   selectedIncidentIds: new Set(),
   validatorView: localStorage.getItem(STORAGE_KEYS.validatorView) || "",
@@ -2843,6 +2844,9 @@ function renderImpactReport() {
 }
 
 function renderImpactHistoryReport() {
+  const historyRows = state.impactHistoryDate
+    ? state.impactHistory.filter((row) => dateInputValue(parseIncidentDate(row.fecha)) === state.impactHistoryDate)
+    : state.impactHistory;
   return `
     <div class="impact-report">
       <div class="impact-hero">
@@ -2850,10 +2854,16 @@ function renderImpactHistoryReport() {
           <span class="eyebrow">Impacto_Turnos</span>
           <h3>Dashboard historico</h3>
         </div>
+        <div class="impact-actions">
+          <label>
+            <span>Fecha</span>
+            <input id="impactHistoryDate" type="date" value="${escapeAttr(state.impactHistoryDate)}" />
+          </label>
+        </div>
       </div>
       <div class="dashboard-grid">
         <article class="chart-card wide">
-          ${renderImpactHistoryDashboard(state.impactHistory)}
+          ${renderImpactHistoryDashboard(historyRows)}
         </article>
       </div>
     </div>
@@ -2947,7 +2957,7 @@ function renderImpactHistoryDashboard(history) {
           ${renderLineChart(trend, "porcentaje_impacto", "% impacto")}
         </div>
         <div class="impact-history-panel">
-          <div class="impact-history-label"><strong>Impacto por corte</strong><span>ultimos 8</span></div>
+          <div class="impact-history-label"><strong>Impacto por corte</strong><span>cortes</span></div>
           ${renderImpactDispatchBars(recent)}
         </div>
         <div class="impact-history-panel turn-pie">
@@ -2970,12 +2980,11 @@ function renderImpactHistoryDashboard(history) {
 }
 
 function renderImpactDispatchBars(rows) {
-  const recent = rows.slice(-8);
-  if (!recent.length) return `<div class="chart-empty">Sin historico.</div>`;
-  const maxImpact = Math.max(...recent.map((row) => row.porcentaje_impacto), 0.1);
+  if (!rows.length) return `<div class="chart-empty">Sin historico.</div>`;
+  const maxImpact = Math.max(...rows.map((row) => row.porcentaje_impacto), 0.1);
   return `
     <div class="impact-dispatch-bars">
-      ${recent.map((row) => `
+      ${rows.map((row) => `
         <div class="impact-dual-bar" title="${escapeHtml(row.fecha)} · ${escapeHtml(row.turno)}">
           <span>${escapeHtml(row.turno.slice(0, 1))}</span>
           <strong>${escapeHtml(row.fecha)}</strong>
@@ -3005,8 +3014,8 @@ function renderImpactTurnSplit(items) {
   return `
     <div class="impact-turn-split">
       <div class="impact-turn-donut" style="--segments:${segments}">
+        <span>Total neto</span>
         <strong>S/ ${money(total)}</strong>
-        <span>neto</span>
       </div>
       <div class="impact-turn-legend">
         ${items.map((item, index) => `
@@ -3032,8 +3041,9 @@ function renderImpactHistoryLocationChart(summary) {
   return `
     <div class="impact-history-location">
       <div class="impact-history-donut" style="--segments:${segments}">
+        <span>Total</span>
         <strong>${summary.totalPallets}</strong>
-        <span>pallets</span>
+        <em>pallets</em>
       </div>
       <div class="impact-history-location-list">
         <div>
@@ -3421,6 +3431,10 @@ function bindAppEvents(group) {
   document.querySelector("#sentExportBtn")?.addEventListener("click", exportSentReport);
   document.querySelector("#impactDate")?.addEventListener("change", (event) => {
     state.impactDate = event.target.value;
+    render();
+  });
+  document.querySelector("#impactHistoryDate")?.addEventListener("change", (event) => {
+    state.impactHistoryDate = event.target.value;
     render();
   });
   document.querySelector("#saveImpactBtn")?.addEventListener("click", saveImpactSnapshot);

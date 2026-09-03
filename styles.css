@@ -1208,8 +1208,11 @@ td input[type="number"] {
 .impact-dispatch-bars {
   display: grid;
   gap: 8px;
-  height: 100%;
-  align-content: center;
+  max-height: 278px;
+  overflow-y: auto;
+  padding-right: 4px;
+  align-content: start;
+  scrollbar-color: #c87333 #f3eee8;
 }
 
 .impact-dual-bar {
@@ -1292,9 +1295,10 @@ td input[type="number"] {
 
 .impact-turn-split {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
-  gap: 16px;
-  align-items: center;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  justify-items: center;
+  align-content: start;
   height: 100%;
 }
 
@@ -1313,23 +1317,24 @@ td input[type="number"] {
 .impact-turn-donut strong,
 .impact-turn-donut span,
 .impact-history-donut strong,
-.impact-history-donut span {
+.impact-history-donut span,
+.impact-history-donut em {
   grid-area: 1 / 1;
   text-align: center;
 }
 
 .impact-turn-donut strong,
 .impact-history-donut strong {
-  max-width: 104px;
+  max-width: 118px;
   color: #fff;
-  font-size: 20px;
+  font-size: 21px;
   line-height: 1.05;
   text-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
 }
 
 .impact-turn-donut span,
 .impact-history-donut span {
-  margin-top: 38px;
+  margin-top: -42px;
   color: rgba(255, 255, 255, 0.95);
   font-size: 9px;
   font-weight: 900;
@@ -1337,8 +1342,19 @@ td input[type="number"] {
   text-shadow: 0 2px 6px rgba(0, 0, 0, 0.24);
 }
 
+.impact-history-donut em {
+  margin-top: 42px;
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  text-transform: uppercase;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.24);
+}
+
 .impact-turn-legend {
   display: grid;
+  width: 100%;
   gap: 10px;
 }
 
@@ -1375,14 +1391,16 @@ td input[type="number"] {
 
 .impact-history-location {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
-  gap: 16px;
-  align-items: center;
-  height: calc(100% - 28px);
+  grid-template-columns: 1fr;
+  gap: 12px;
+  justify-items: center;
+  align-content: start;
+  height: 100%;
 }
 
 .impact-history-location-list {
   display: grid;
+  width: 100%;
   gap: 10px;
 }
 
