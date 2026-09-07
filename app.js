@@ -7,7 +7,7 @@ const SHEETS = {
   cargo: "CARGA",
 };
 const REPORT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1EBG_HWQ3lp4UWjPtpMgc0UMe_mH53RWtgAtnDMCQ_nc/edit";
-const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbxhIP_3ELlWmKtmvOK7o7I_vdCqEpH2OeR8ObOImeSbvaB_yrQi3Z9qQHtNjNasc221/exec";
+const REPORT_ENDPOINT = "https://script.google.com/macros/s/AKfycbwct7r6dy276p3Ofj0bdztCnYa1NG6JQRFg4_zfWdRn_adH6X01mSvBCsd-1kBpsSsY/exec";
 const REPORT_REFRESH_MS = 3000;
 const STORAGE_KEYS = {
   session: "palletValidator.session",
@@ -51,6 +51,7 @@ const state = {
   sentRows: [],
   cargoRows: [],
   impactHistory: [],
+  impactDetailHistory: [],
   supervisorView: localStorage.getItem(STORAGE_KEYS.supervisorView) || "",
   reportModule: "summary",
   dashboardTurn: "todos",
@@ -70,7 +71,11 @@ const state = {
   sentStatusFilter: "todos",
   sentDetailKey: "",
   impactDate: "",
+  impactDateFrom: "",
+  impactDateTo: "",
   impactHistoryDate: "",
+  impactHistoryDateFrom: "",
+  impactHistoryDateTo: "",
   impactSaving: false,
   selectedIncidentIds: new Set(),
   validatorView: localStorage.getItem(STORAGE_KEYS.validatorView) || "",
@@ -80,6 +85,7 @@ const state = {
 
 const app = document.querySelector("#app");
 let reportRefreshTimer = null;
+let reportStaticLoadPromise = null;
 let queryRenderTimer = null;
 
 function canViewSupervisorReport() {
@@ -320,8 +326,12 @@ function loadImpactHistoryViaJsonp() {
   return callReportApi("listImpact").then((payload) => payload.rows || []);
 }
 
+function loadImpactDetailHistoryViaJsonp() {
+  return callReportApi("listImpactDetail").then((payload) => payload.rows || []);
+}
+
 function callReportApi(action, params = {}) {
-  if (action === "create" || action === "updateStatus" || action === "deleteIncidents" || action === "saveImpact") {
+  if (action === "create" || action === "updateStatus" || action === "deleteIncidents" || action === "saveImpact" || action === "saveImpactDetail") {
     return callReportApiPost(action, params).catch(() => callReportApiJsonp(action, params));
   }
   return callReportApiJsonp(action, params);
@@ -405,13 +415,12 @@ async function loadReportIncidents(options = {}) {
   if (!silent) render();
   try {
     const previousSignature = JSON.stringify(state.incidents);
-    const [remoteRows] = await Promise.all([
-      loadReportViaJsonp(),
-      canViewSupervisorReport() ? loadSentRows({ silent: true }) : Promise.resolve(),
-      canViewSupervisorReport() ? loadCargoRows({ silent: true }) : Promise.resolve(),
-      canViewSupervisorReport() ? loadOperationalRows({ silent: true }) : Promise.resolve(),
-      canViewSupervisorReport() ? loadImpactHistory({ silent: true }) : Promise.resolve(),
-    ]);
+    const remoteRows = await loadReportViaJsonp();
+    if (canViewSupervisorReport() && state.supervisorView === "report") {
+      loadImpactHistory({ silent: true }).then(() => {
+        if (state.reportModule === "impactHistory") render();
+      });
+    }
     const nextIncidents = remoteRows.map(normalizeIncidentForExport).filter(isCleanIncident);
     const nextSignature = JSON.stringify(nextIncidents);
     const activeElement = document.activeElement;
@@ -442,11 +451,10 @@ async function loadOperationalRows(options = {}) {
   const force = Boolean(options.force);
   if (!force && state.rows.length && state.productCosts.size) return;
   try {
-    const [cartonRows, productRows] = await Promise.all([
+    const [cartonRows] = await Promise.all([
       loadSheetRows(SHEETS.cartons),
-      loadSheetRows(SHEETS.products),
+      loadProductCosts({ force }).catch(() => null),
     ]);
-    state.productCosts = buildProductCosts(productRows);
     state.rows = cartonRows
       .filter((row) => row.Codigo || row["Nro LPN"] || row["Nro Pallet"])
       .map((row) => ({
@@ -460,13 +468,44 @@ async function loadOperationalRows(options = {}) {
   }
 }
 
+async function loadProductCosts(options = {}) {
+  const force = Boolean(options.force);
+  if (!force && state.productCosts.size) return;
+  const productRows = await loadSheetRows(SHEETS.products);
+  state.productCosts = buildProductCosts(productRows);
+}
+
+function loadSupervisorStaticData(options = {}) {
+  const force = Boolean(options.force);
+  if (!canViewSupervisorReport()) return Promise.resolve();
+  if (!force && reportStaticLoadPromise) return reportStaticLoadPromise;
+  const loaders = [];
+  if (force || state.sentStatus !== "ready") loaders.push(loadSentRows({ silent: true, force }));
+  if (force || state.cargoStatus !== "ready") loaders.push(loadCargoRows({ silent: true, force }));
+  if (force || !state.productCosts.size) loaders.push(loadProductCosts({ force }));
+  if (!loaders.length) return Promise.resolve();
+  reportStaticLoadPromise = Promise.allSettled(loaders).finally(() => {
+    reportStaticLoadPromise = null;
+    render();
+  });
+  return reportStaticLoadPromise;
+}
+
 async function loadImpactHistory(options = {}) {
   const silent = Boolean(options.silent);
   if (!canViewSupervisorReport()) return;
   state.impactStatus = silent ? state.impactStatus : "loading";
   state.impactError = "";
   try {
-    state.impactHistory = (await loadImpactHistoryViaJsonp()).map(normalizeImpactHistoryRow);
+    const impactRows = await loadImpactHistoryViaJsonp();
+    let detailRows = [];
+    try {
+      detailRows = await loadImpactDetailHistoryViaJsonp();
+    } catch (detailError) {
+      detailRows = [];
+    }
+    state.impactHistory = impactRows.map(normalizeImpactHistoryRow);
+    state.impactDetailHistory = detailRows.map(normalizeImpactDetailHistoryRow);
     state.impactStatus = "ready";
   } catch (error) {
     state.impactStatus = "error";
@@ -500,7 +539,9 @@ async function loadSheetRows(sheetName) {
 
 async function loadSentRows(options = {}) {
   const silent = Boolean(options.silent);
+  const force = Boolean(options.force);
   if (!canViewSupervisorReport()) return;
+  if (!force && state.sentStatus === "ready") return;
   state.sentStatus = silent ? state.sentStatus : "loading";
   state.sentError = "";
   try {
@@ -515,7 +556,9 @@ async function loadSentRows(options = {}) {
 
 async function loadCargoRows(options = {}) {
   const silent = Boolean(options.silent);
+  const force = Boolean(options.force);
   if (!canViewSupervisorReport()) return;
+  if (!force && state.cargoStatus === "ready") return;
   state.cargoStatus = silent ? state.cargoStatus : "loading";
   state.cargoError = "";
   try {
@@ -660,7 +703,10 @@ function login(event) {
   saveJson(STORAGE_KEYS.session, state.user);
   render();
   if (canViewSupervisorReport()) {
-    if (state.supervisorView) loadReportIncidents();
+    if (state.supervisorView) {
+      if (state.supervisorView === "report") loadSupervisorStaticData();
+      loadReportIncidents();
+    }
   } else if (state.validatorView) {
     loadData();
   }
@@ -690,6 +736,7 @@ function chooseSupervisorView(view) {
   localStorage.setItem(STORAGE_KEYS.supervisorView, view);
   startReportAutoRefresh();
   render();
+  if (view === "report") loadSupervisorStaticData();
   loadReportIncidents({ silent: true });
 }
 
@@ -1562,6 +1609,33 @@ function dateInputValue(date) {
   ].join("-");
 }
 
+function historyDateKey(value) {
+  const raw = normalize(value);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  return dateInputValue(parseIncidentDate(raw));
+}
+
+function dateKeyTime(value) {
+  const key = historyDateKey(value);
+  const match = key.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return 0;
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])).getTime();
+}
+
+function historyDate(value) {
+  const key = historyDateKey(value);
+  const match = key.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return parseIncidentDate(value);
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function shortDateLabel(value) {
+  const key = historyDateKey(value);
+  if (!key) return normalize(value);
+  const [year, month, day] = key.split("-");
+  return `${day}/${month}`;
+}
+
 function rowOperationalDate(row) {
   return parseIncidentDate(row?._shipment?.fechaDespacho) || row?._date || null;
 }
@@ -1623,6 +1697,45 @@ function normalizeImpactHistoryRow(row) {
     nivel_impacto: row.nivel_impacto || "",
     fecha_calculo: row.fecha_calculo || "",
     id: row.id || "",
+  };
+}
+
+function normalizeImpactDetailHistoryRow(row) {
+  return {
+    fecha_corte: row.fecha_corte || "",
+    turno_corte: row.turno_corte || "",
+    id_incidencia: row.id_incidencia || "",
+    estado_incidencia: row.estado_incidencia || "",
+    fecha_incidente: row.fecha_incidente || "",
+    pallet: row.pallet || "",
+    lpn: row.lpn || "",
+    codigo: row.codigo || "",
+    producto: row.producto || "",
+    bultos: toNumber(row.bultos),
+    costo_neto: toNumber(row.costo_neto),
+    estado_envio: row.estado_envio || "",
+    destino: row.destino || "",
+    nro_carga: row.nro_carga || "",
+    placa: row.placa || "",
+    chofer: row.chofer || "",
+    paletas_carga: toNumber(row.paletas_carga),
+    fecha_envio: row.fecha_envio || "",
+    fecha_calculo: row.fecha_calculo || "",
+    id: row.id || "",
+  };
+}
+
+function impactHistoryToImpactRow(row) {
+  const turnKey = normalizeSearch(row.turno).includes("noche") ? "noche" : "dia";
+  const incidentRows = state.impactDetailHistory
+    .filter((detail) => historyDateKey(detail.fecha_corte) === historyDateKey(row.fecha) && normalizeSearch(detail.turno_corte) === normalizeSearch(row.turno))
+    .map((detail) => impactDetailToIncidentRow(detail));
+  return {
+    ...row,
+    turnKey,
+    bultos_despachados: 0,
+    pallets_sin_costo: 0,
+    incidentRows,
   };
 }
 
@@ -1746,9 +1859,142 @@ function impactRowsForDate(dateValue) {
   });
 }
 
+function impactDatesInRange(fromValue, toValue) {
+  const from = fromValue || "";
+  const to = toValue || "";
+  const dates = new Set();
+  const cargos = cargoMap();
+  allDashboardRows().forEach((row) => {
+    const dateKey = dateInputValue(row._date);
+    if (dateKey && (!from || dateKey >= from) && (!to || dateKey <= to)) dates.add(dateKey);
+  });
+  state.sentRows.forEach((row) => {
+    const dateKey = dateInputValue(shipmentDate(enrichShipmentWithCargo(row, cargos)));
+    if (dateKey && (!from || dateKey >= from) && (!to || dateKey <= to)) dates.add(dateKey);
+  });
+  state.impactHistory.forEach((row) => {
+    const dateKey = historyDateKey(row.fecha);
+    if (dateKey && (!from || dateKey >= from) && (!to || dateKey <= to)) dates.add(dateKey);
+  });
+  if (!dates.size && (from || to)) dates.add(from || to);
+  return [...dates].sort();
+}
+
+function impactRowsForRange(fromValue, toValue) {
+  return impactDatesInRange(fromValue, toValue).flatMap((dateKey) => {
+    const savedRows = state.impactHistory.filter((row) => historyDateKey(row.fecha) === dateKey);
+    if (savedRows.length) return savedRows.map(impactHistoryToImpactRow);
+    return impactRowsForDate(dateKey);
+  });
+}
+
+function aggregateImpactTurnRows(rows) {
+  const grouped = new Map([
+    ["dia", {
+      turno: "Dia",
+      turnKey: "dia",
+      pallets_enviados: 0,
+      costo_despachado: 0,
+      bultos_despachados: 0,
+      pallets_sin_costo: 0,
+      pallets_con_incidencia: 0,
+      pallets_incidencia_enviados: 0,
+      pallets_incidencia_cd: 0,
+      incidencias: 0,
+      bultos_faltantes: 0,
+      costo_incidencias_bruto: 0,
+      costo_regularizado: 0,
+      costo_incidencias_neto: 0,
+      costo_incidencias_enviadas_neto: 0,
+      costo_incidencias_cd_neto: 0,
+      incidentRows: [],
+    }],
+    ["noche", {
+      turno: "Noche",
+      turnKey: "noche",
+      pallets_enviados: 0,
+      costo_despachado: 0,
+      bultos_despachados: 0,
+      pallets_sin_costo: 0,
+      pallets_con_incidencia: 0,
+      pallets_incidencia_enviados: 0,
+      pallets_incidencia_cd: 0,
+      incidencias: 0,
+      bultos_faltantes: 0,
+      costo_incidencias_bruto: 0,
+      costo_regularizado: 0,
+      costo_incidencias_neto: 0,
+      costo_incidencias_enviadas_neto: 0,
+      costo_incidencias_cd_neto: 0,
+      incidentRows: [],
+    }],
+  ]);
+  rows.forEach((row) => {
+    const key = row.turnKey || (normalizeSearch(row.turno).includes("noche") ? "noche" : "dia");
+    const target = grouped.get(key);
+    if (!target) return;
+    [
+      "pallets_enviados",
+      "costo_despachado",
+      "bultos_despachados",
+      "pallets_sin_costo",
+      "pallets_con_incidencia",
+      "pallets_incidencia_enviados",
+      "pallets_incidencia_cd",
+      "incidencias",
+      "bultos_faltantes",
+      "costo_incidencias_bruto",
+      "costo_regularizado",
+      "costo_incidencias_neto",
+      "costo_incidencias_enviadas_neto",
+      "costo_incidencias_cd_neto",
+    ].forEach((fieldName) => {
+      target[fieldName] += toNumber(row[fieldName]);
+    });
+    target.incidentRows.push(...(row.incidentRows || []));
+  });
+  return [...grouped.values()].map((row) => ({
+    ...row,
+    porcentaje_impacto: row.costo_despachado ? (row.costo_incidencias_neto / row.costo_despachado) * 100 : 0,
+    nivel_impacto: impactLevel(row.costo_despachado ? (row.costo_incidencias_neto / row.costo_despachado) * 100 : 0),
+  }));
+}
+
+function impactDetailRowsForSave(rows) {
+  const calculatedAt = new Date().toLocaleString("es-PE");
+  return rows.flatMap((turn) => turn.incidentRows.map((row) => {
+    const shipment = row._shipment || {};
+    const isRegularized = row.estado === "Regularizado";
+    return {
+      fecha_corte: turn.fecha,
+      turno_corte: turn.turno,
+      id_incidencia: row.id || "",
+      estado_incidencia: row.estado || "",
+      fecha_incidente: row.fecha_incidente || "",
+      pallet: row.pallet || "",
+      lpn: row.lpn || "",
+      codigo: row.codigos || "",
+      producto: row.descripcion || "",
+      bultos: row._bultos.toFixed(2),
+      costo_neto: (isRegularized ? 0 : row._precio).toFixed(2),
+      estado_envio: row._sent ? "Enviado" : "En CD",
+      destino: shipment.tienda || row.tienda || "",
+      nro_carga: shipment.carga || "",
+      placa: shipment.placa || "",
+      chofer: shipment.chofer || "",
+      paletas_carga: toNumber(shipment.paletasCarga).toFixed(2),
+      fecha_envio: shipment.fechaDespacho || "",
+      fecha_calculo: calculatedAt,
+    };
+  }));
+}
+
 async function saveImpactSnapshot() {
   if (!canManageIncidents()) return;
-  const rows = impactRowsForDate(state.impactDate || dateInputValue(new Date()));
+  const fallbackDate = state.impactDate || dateInputValue(new Date());
+  const from = state.impactDateFrom || fallbackDate;
+  const to = state.impactDateTo || from;
+  const rows = impactRowsForRange(from, to);
   state.impactSaving = true;
   render();
   try {
@@ -1772,7 +2018,17 @@ async function saveImpactSnapshot() {
       fecha_calculo: new Date().toLocaleString("es-PE"),
     }));
     const response = await callReportApi("saveImpact", { rows: JSON.stringify(payloadRows) });
-    toast(`Historico actualizado: ${response.saved || payloadRows.length} turnos.`);
+    const payloadDetailRows = impactDetailRowsForSave(rows);
+    let detailSaved = 0;
+    try {
+      const detailResponse = await callReportApi("saveImpactDetail", { rows: JSON.stringify(payloadDetailRows) });
+      detailSaved = detailResponse.saved || payloadDetailRows.length;
+    } catch (detailError) {
+      toast(`Historico de turnos actualizado: ${response.saved || payloadRows.length}. Falta publicar Apps Script para guardar el detalle.`);
+      await loadImpactHistory({ silent: true });
+      return;
+    }
+    toast(`Historico actualizado: ${response.saved || payloadRows.length} turnos y ${detailSaved} detalles.`);
     await loadImpactHistory({ silent: true });
   } catch (error) {
     toast("No se pudo guardar el historico de impacto.");
@@ -2010,7 +2266,7 @@ function impactTrendByDate(selectedDate, currentRows) {
     if (!row.fecha) return;
     const current = map.get(row.fecha) || {
       key: row.fecha,
-      time: parseIncidentDate(row.fecha)?.getTime() || 0,
+      time: dateKeyTime(row.fecha),
       dispatch: 0,
       net: 0,
       count: 0,
@@ -2028,7 +2284,7 @@ function impactTrendByDate(selectedDate, currentRows) {
     const net = currentRows.reduce((sum, row) => sum + row.costo_incidencias_neto, 0);
     map.set(selectedDate, {
       key: selectedDate,
-      time: parseIncidentDate(selectedDate)?.getTime() || Date.now(),
+      time: dateKeyTime(selectedDate) || Date.now(),
       dispatch,
       net,
       count: currentRows.reduce((sum, row) => sum + row.incidencias, 0),
@@ -2044,6 +2300,42 @@ function impactTrendByDate(selectedDate, currentRows) {
     .filter((point) => point.dispatch > 0 || point.net > 0 || point.count > 0)
     .sort((a, b) => a.time - b.time)
     .slice(-10);
+}
+
+function impactTrendByTurnForRange(fromValue, toValue, currentRows) {
+  const from = fromValue || "";
+  const to = toValue || from || "";
+  const map = new Map();
+  state.impactHistory.forEach((row) => {
+    const dateKey = historyDateKey(row.fecha);
+    if (!dateKey) return;
+    if (from && dateKey < from) return;
+    if (to && dateKey > to) return;
+    const key = `${dateKey}|${row.turno}`;
+    map.set(key, {
+      fecha: dateKey,
+      turno: row.turno,
+      time: dateKeyTime(dateKey) + (normalizeSearch(row.turno).includes("noche") ? 1 : 0),
+      porcentaje_impacto: row.porcentaje_impacto,
+    });
+  });
+  currentRows.forEach((row) => {
+    const dateKey = historyDateKey(row.fecha);
+    if (!dateKey) return;
+    if (from && dateKey < from) return;
+    if (to && dateKey > to) return;
+    const key = `${dateKey}|${row.turno}`;
+    map.set(key, {
+      fecha: dateKey,
+      turno: row.turno,
+      time: dateKeyTime(dateKey) + (normalizeSearch(row.turno).includes("noche") ? 1 : 0),
+      porcentaje_impacto: row.porcentaje_impacto,
+    });
+  });
+  return [...map.values()]
+    .filter((point) => toNumber(point.porcentaje_impacto) > 0 || point.fecha)
+    .sort((a, b) => a.time - b.time)
+    .slice(-16);
 }
 
 function renderLineChart(points, valueKey = "count", valueLabel = "incidencias") {
@@ -2074,6 +2366,57 @@ function renderLineChart(points, valueKey = "count", valueLabel = "incidencias")
       `).join("")}
     </svg>
     <div class="chart-axis">${coords.slice(-5).map((point) => `<span>${escapeHtml(point.key)}</span>`).join("")}</div>
+  `;
+}
+
+function renderImpactHistoryTrendChart(points) {
+  if (!points.length) return `<div class="chart-empty">Sin data.</div>`;
+  const width = 720;
+  const height = 240;
+  const padX = 36;
+  const padTop = 34;
+  const padBottom = 38;
+  const max = Math.max(...points.map((point) => toNumber(point.porcentaje_impacto)), 0.1);
+  const coords = points.map((point, index) => {
+    const x = points.length === 1 ? width / 2 : padX + (index * (width - padX * 2)) / (points.length - 1);
+    const value = toNumber(point.porcentaje_impacto);
+    const y = height - padBottom - (value / max) * (height - padTop - padBottom);
+    const turn = normalizeSearch(point.turno);
+    return {
+      ...point,
+      x,
+      y,
+      value,
+      label: value.toFixed(2),
+      turnClass: turn.includes("noche") ? "night" : "day",
+      turnShort: turn.includes("noche") ? "N" : "D",
+    };
+  });
+  const path = coords.map((point, index) => `${index ? "L" : "M"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
+  const area = `${path} L ${coords[coords.length - 1].x.toFixed(1)} ${height - padBottom} L ${coords[0].x.toFixed(1)} ${height - padBottom} Z`;
+  const firstDate = shortDateLabel(coords[0].fecha);
+  const lastDate = shortDateLabel(coords[coords.length - 1].fecha);
+  return `
+    <svg class="line-chart impact-history-trend-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Tendencia de impacto por fecha y turno">
+      <path class="chart-grid" d="M ${padX} ${height - padBottom} H ${width - padX} M ${padX} ${padTop} H ${width - padX}" />
+      <path class="chart-area" d="${area}" />
+      <path class="chart-line" d="${path}" />
+      ${coords.map((point) => `
+        <g>
+          <circle class="chart-dot impact-turn-dot ${point.turnClass}" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="5"><title>${escapeHtml(point.fecha)} ${escapeHtml(point.turno)}: ${point.label}% impacto</title></circle>
+          <text class="impact-turn-letter" x="${point.x.toFixed(1)}" y="${(point.y + 3.5).toFixed(1)}">${point.turnShort}</text>
+          <text class="chart-value" x="${point.x.toFixed(1)}" y="${Math.max(14, point.y - 12).toFixed(1)}">${point.label}</text>
+        </g>
+      `).join("")}
+    </svg>
+    <div class="chart-axis impact-history-axis">
+      <span>${escapeHtml(firstDate)}</span>
+      <span>${escapeHtml(lastDate)}</span>
+    </div>
+    <div class="impact-history-trend-legend">
+      <span><i class="day"></i>Dia</span>
+      <span><i class="night"></i>Noche</span>
+    </div>
   `;
 }
 
@@ -2235,10 +2578,40 @@ function renderAdvanceReport() {
   `;
 }
 
+function impactDetailNaturalKey(row) {
+  return [
+    historyDateKey(row.fecha_corte) || dateInputValue(parseIncidentDate(row.fecha_incidente)),
+    palletKey(row.pallet),
+    normalizeSearch(row.codigo || row.codigos),
+  ].join("|");
+}
+
 function sentIncidentRows() {
   const sentMap = sentPalletMap();
   const cargos = cargoMap();
-  return allDashboardRows().map((row) => {
+  const detailByIncident = new Map();
+  const detailByNaturalKey = new Map();
+  state.impactDetailHistory.forEach((row) => {
+    if (row.id_incidencia && !detailByIncident.has(String(row.id_incidencia))) {
+      detailByIncident.set(String(row.id_incidencia), row);
+    }
+    const naturalKey = impactDetailNaturalKey(row);
+    if (naturalKey !== "||" && !detailByNaturalKey.has(naturalKey)) {
+      detailByNaturalKey.set(naturalKey, row);
+    }
+  });
+  const usedDetails = new Set();
+  const rows = allDashboardRows().map((row) => {
+    const savedDetail = detailByIncident.get(String(row.id || "")) || detailByNaturalKey.get(impactDetailNaturalKey({
+      fecha_corte: dateInputValue(row._date),
+      fecha_incidente: row.fecha_incidente,
+      pallet: row.pallet,
+      codigo: row.codigos,
+    }));
+    if (savedDetail) {
+      usedDetails.add(savedDetail.id || savedDetail.id_incidencia || impactDetailNaturalKey(savedDetail));
+      return impactDetailToIncidentRow(savedDetail, row);
+    }
     const matches = (sentMap.get(palletKey(row.pallet)) || []).map((shipment) => enrichShipmentWithCargo(shipment, cargos));
     return {
       ...row,
@@ -2247,6 +2620,45 @@ function sentIncidentRows() {
       _shipments: matches,
     };
   });
+  state.impactDetailHistory.forEach((detail) => {
+    const key = detail.id || detail.id_incidencia || impactDetailNaturalKey(detail);
+    if (!key || usedDetails.has(key)) return;
+    rows.push(impactDetailToIncidentRow(detail));
+  });
+  return rows;
+}
+
+function impactDetailToIncidentRow(detail, base = {}) {
+  const sent = normalizeSearch(detail.estado_envio).includes("enviado");
+  const detailDate = parseIncidentDate(detail.fecha_incidente) || historyDate(detail.fecha_corte);
+  const impactDate = historyDate(detail.fecha_corte) || detailDate;
+  return {
+    ...base,
+    id: detail.id_incidencia || base.id || detail.id || "",
+    estado: detail.estado_incidencia || base.estado || "",
+    fecha_incidente: detail.fecha_incidente || base.fecha_incidente || "",
+    pallet: detail.pallet || base.pallet || "",
+    lpn: detail.lpn || base.lpn || "",
+    codigos: detail.codigo || base.codigos || "",
+    descripcion: detail.producto || base.descripcion || "",
+    _date: detailDate || base._date || null,
+    _impactDate: impactDate || base._impactDate || null,
+    _turn: base._turn || impactTurn(impactDate || detailDate),
+    _bultos: toNumber(detail.bultos),
+    _precio: toNumber(detail.costo_neto),
+    _sent: sent,
+    _shipment: sent ? {
+      tienda: detail.destino || "",
+      local: "",
+      carga: detail.nro_carga || "",
+      placa: detail.placa || "",
+      chofer: detail.chofer || "",
+      paletasCarga: detail.paletas_carga || "",
+      fechaDespacho: detail.fecha_envio || "",
+    } : null,
+    _shipments: [],
+    _fromImpactDetail: true,
+  };
 }
 
 function filteredSentIncidentRows(rows) {
@@ -2275,7 +2687,7 @@ function filteredSentIncidentRows(rows) {
       row.estado === state.sentStatusFilter;
     const storeValue = normalize(shipment.tienda || row.tienda || "Sin tienda");
     const storeMatch = state.sentStore === "todos" || storeValue === state.sentStore;
-    const dateValue = dateInputValue(rowOperationalDate(row));
+    const dateValue = dateInputValue(row._impactDate || rowOperationalDate(row));
     const fromMatch = !from || (dateValue && dateValue >= from);
     const toMatch = !to || (dateValue && dateValue <= to);
     return textMatch && statusMatch && storeMatch && fromMatch && toMatch;
@@ -2315,6 +2727,32 @@ function shipmentStoreSummaries(incidentRows = null) {
     }
     map.get(key).pallets.add(pallet);
   });
+  if (!map.size && incidentRows) {
+    incidentRows
+      .filter((row) => row._sent && row._shipment)
+      .forEach((row) => {
+        const shipment = row._shipment;
+        const pallet = palletKey(row.pallet);
+        if (!pallet) return;
+        const carga = cargoKey(shipment.carga) || "SIN CARGA";
+        const tienda = normalize(shipment.tienda || row.tienda || "Sin tienda");
+        const key = `${carga}|${tienda}`;
+        if (!map.has(key)) {
+          map.set(key, {
+            key,
+            carga: shipment.carga || "Sin carga",
+            tienda,
+            local: shipment.local || "",
+            placa: shipment.placa || "",
+            chofer: shipment.chofer || "",
+            fechaEnvio: shipment.fechaDespacho || "",
+            paletasCarga: shipment.paletasCarga || "",
+            pallets: new Set(),
+          });
+        }
+        map.get(key).pallets.add(pallet);
+      });
+  }
   return [...map.values()]
     .map((row) => ({ ...row, count: row.pallets.size }))
     .sort((a, b) => b.count - a.count || a.tienda.localeCompare(b.tienda));
@@ -2354,6 +2792,33 @@ function sentDetailRows(detailKey) {
       incidents: incidentsByPallet.get(pallet) || [],
     });
   });
+
+  if (!map.size) {
+    filteredSentIncidentRows(sentIncidentRows())
+      .filter((row) => row._sent && row._shipment)
+      .forEach((row) => {
+        const shipment = row._shipment;
+        const key = `${cargoKey(shipment.carga) || "SIN CARGA"}|${normalize(shipment.tienda || "Sin tienda")}`;
+        if (key !== detailKey) return;
+        const pallet = palletKey(row.pallet);
+        if (!pallet) return;
+        if (!map.has(pallet)) {
+          map.set(pallet, {
+            pallet: row.pallet,
+            lpn: row.lpn,
+            tienda: shipment.tienda,
+            local: shipment.local,
+            carga: shipment.carga,
+            placa: shipment.placa,
+            chofer: shipment.chofer,
+            fechaDespacho: shipment.fechaDespacho,
+            paletasCarga: shipment.paletasCarga,
+            incidents: [],
+          });
+        }
+        map.get(pallet).incidents.push(row);
+      });
+  }
 
   return [...map.values()].sort((a, b) => Number(Boolean(b.incidents.length)) - Number(Boolean(a.incidents.length)) || palletKey(a.pallet).localeCompare(palletKey(b.pallet)));
 }
@@ -2720,10 +3185,13 @@ function renderRecentIncidents(rows) {
 }
 
 function renderImpactReport() {
-  const selectedDate = state.impactDate || dateInputValue(new Date());
-  if (!state.impactDate) state.impactDate = selectedDate;
-  const rows = impactRowsForDate(selectedDate);
-  const impactTrend = impactTrendByDate(selectedDate, rows);
+  const fallbackDate = state.impactDate || dateInputValue(new Date());
+  const selectedFrom = state.impactDateFrom || "";
+  const selectedTo = state.impactDateTo || "";
+  state.impactDate = selectedFrom || selectedTo || fallbackDate;
+  const rows = impactRowsForRange(selectedFrom, selectedTo);
+  const comparisonRows = aggregateImpactTurnRows(rows);
+  const impactTrend = impactTrendByTurnForRange(selectedFrom, selectedTo, rows);
   const totalDispatch = rows.reduce((sum, row) => sum + row.costo_despachado, 0);
   const totalNetIncidents = rows.reduce((sum, row) => sum + row.costo_incidencias_neto, 0);
   const totalGrossIncidents = rows.reduce((sum, row) => sum + row.costo_incidencias_bruto, 0);
@@ -2744,8 +3212,12 @@ function renderImpactReport() {
           </div>
         <div class="impact-actions">
           <label>
-            <span>Fecha</span>
-            <input id="impactDate" type="date" value="${escapeAttr(selectedDate)}" />
+            <span>Desde</span>
+            <input id="impactDateFrom" type="date" value="${escapeAttr(selectedFrom)}" />
+          </label>
+          <label>
+            <span>Hasta</span>
+            <input id="impactDateTo" type="date" value="${escapeAttr(selectedTo)}" />
           </label>
           ${canManageIncidents() ? `<button class="btn warning" id="saveImpactBtn" type="button" ${state.impactSaving ? "disabled" : ""}>${state.impactSaving ? "Guardando..." : "Guardar historico"}</button>` : ""}
         </div>
@@ -2760,7 +3232,7 @@ function renderImpactReport() {
         <article class="chart-card wide">
           <div class="chart-title"><h3>Comparativa del turno</h3><span>Dia / Noche</span></div>
           <div class="impact-turn-grid">
-            ${rows.map((row) => `
+            ${comparisonRows.map((row) => `
               <article class="impact-turn-card ${row.nivel_impacto.toLowerCase()}">
                 <div class="bar-head">
                   <strong>Turno ${escapeHtml(row.turno)}</strong>
@@ -2779,12 +3251,12 @@ function renderImpactReport() {
           </div>
         </article>
         <article class="chart-card wide">
-          <div class="chart-title"><h3>Tendencia de impacto</h3><span>Por fecha</span></div>
-          ${renderLineChart(impactTrend, "porcentaje_impacto", "% impacto")}
+          <div class="chart-title"><h3>Tendencia de impacto</h3><span>Por fecha y turno</span></div>
+          ${renderImpactHistoryTrendChart(impactTrend)}
         </article>
         <article class="chart-card">
           <div class="chart-title"><h3>Nivel de impacto</h3><span>Semaforo</span></div>
-          ${renderBars(rows.map((row) => ({
+          ${renderBars(comparisonRows.map((row) => ({
             key: `Turno ${row.turno}`,
             count: row.incidencias,
             bultos: row.bultos_faltantes,
@@ -2844,9 +3316,12 @@ function renderImpactReport() {
 }
 
 function renderImpactHistoryReport() {
-  const historyRows = state.impactHistoryDate
-    ? state.impactHistory.filter((row) => dateInputValue(parseIncidentDate(row.fecha)) === state.impactHistoryDate)
-    : state.impactHistory;
+  const historyRows = state.impactHistory.filter((row) => {
+    const dateKey = historyDateKey(row.fecha);
+    const fromMatch = !state.impactHistoryDateFrom || (dateKey && dateKey >= state.impactHistoryDateFrom);
+    const toMatch = !state.impactHistoryDateTo || (dateKey && dateKey <= state.impactHistoryDateTo);
+    return fromMatch && toMatch;
+  });
   return `
     <div class="impact-report">
       <div class="impact-hero">
@@ -2856,8 +3331,12 @@ function renderImpactHistoryReport() {
         </div>
         <div class="impact-actions">
           <label>
-            <span>Fecha</span>
-            <input id="impactHistoryDate" type="date" value="${escapeAttr(state.impactHistoryDate)}" />
+            <span>Desde</span>
+            <input id="impactHistoryDateFrom" type="date" value="${escapeAttr(state.impactHistoryDateFrom)}" />
+          </label>
+          <label>
+            <span>Hasta</span>
+            <input id="impactHistoryDateTo" type="date" value="${escapeAttr(state.impactHistoryDateTo)}" />
           </label>
         </div>
       </div>
@@ -2937,7 +3416,9 @@ function renderImpactHistoryDashboard(history) {
     };
   });
   const trend = recent.map((row) => ({
-    key: `${row.fecha} ${row.turno}`,
+    key: `${shortDateLabel(row.fecha)} ${row.turno}`,
+    fecha: row.fecha,
+    turno: row.turno,
     porcentaje_impacto: row.porcentaje_impacto,
     count: row.incidencias,
     bultos: row.bultos_faltantes,
@@ -2954,7 +3435,7 @@ function renderImpactHistoryDashboard(history) {
       <div class="impact-history-grid">
         <div class="impact-history-panel trend">
           <div class="impact-history-label"><strong>Tendencia</strong><span>% impacto</span></div>
-          ${renderLineChart(trend, "porcentaje_impacto", "% impacto")}
+          ${renderImpactHistoryTrendChart(trend)}
         </div>
         <div class="impact-history-panel">
           <div class="impact-history-label"><strong>Impacto por corte</strong><span>cortes</span></div>
@@ -3064,7 +3545,13 @@ function renderImpactHistoryLocationChart(summary) {
 }
 
 function renderImpactIncidentDetail(turnRows) {
-  const rows = turnRows.flatMap((turn) => turn.incidentRows.map((row) => ({ ...row, _impactTurn: turn.turno })));
+  const selectedDates = new Set(turnRows.map((turn) => historyDateKey(turn.fecha)).filter(Boolean));
+  const savedRows = state.impactDetailHistory
+    .filter((row) => selectedDates.has(historyDateKey(row.fecha_corte)))
+    .map((row) => ({ ...impactDetailToIncidentRow(row), _impactTurn: row.turno_corte || "" }));
+  const rows = savedRows.length
+    ? savedRows
+    : turnRows.flatMap((turn) => turn.incidentRows.map((row) => ({ ...row, _impactTurn: turn.turno })));
   if (!rows.length) return `<div class="chart-empty">Sin incidencias para esta fecha.</div>`;
   return `
     <div class="sent-table-wrap compact-table">
@@ -3429,12 +3916,32 @@ function bindAppEvents(group) {
     render();
   });
   document.querySelector("#sentExportBtn")?.addEventListener("click", exportSentReport);
-  document.querySelector("#impactDate")?.addEventListener("change", (event) => {
+  document.querySelector("#impactDateFrom")?.addEventListener("change", (event) => {
+    state.impactDateFrom = event.target.value;
     state.impactDate = event.target.value;
+    if (state.impactDateTo && state.impactDateFrom && state.impactDateTo < state.impactDateFrom) {
+      state.impactDateTo = state.impactDateFrom;
+    }
+    render();
+  });
+  document.querySelector("#impactDateTo")?.addEventListener("change", (event) => {
+    state.impactDateTo = event.target.value;
+    if (state.impactDateFrom && state.impactDateTo && state.impactDateFrom > state.impactDateTo) {
+      state.impactDateFrom = state.impactDateTo;
+      state.impactDate = state.impactDateFrom;
+    }
     render();
   });
   document.querySelector("#impactHistoryDate")?.addEventListener("change", (event) => {
     state.impactHistoryDate = event.target.value;
+    render();
+  });
+  document.querySelector("#impactHistoryDateFrom")?.addEventListener("change", (event) => {
+    state.impactHistoryDateFrom = event.target.value;
+    render();
+  });
+  document.querySelector("#impactHistoryDateTo")?.addEventListener("change", (event) => {
+    state.impactHistoryDateTo = event.target.value;
     render();
   });
   document.querySelector("#saveImpactBtn")?.addEventListener("click", saveImpactSnapshot);
@@ -3537,6 +4044,7 @@ if (canViewSupervisorReport()) {
   if (state.user.role === "Invitado") state.supervisorView = "report";
   if (state.supervisorView) {
     startReportAutoRefresh();
+    if (state.supervisorView === "report") loadSupervisorStaticData();
     loadReportIncidents();
   }
 } else if (state.user && state.validatorView) {

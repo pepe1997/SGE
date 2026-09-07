@@ -1205,6 +1205,59 @@ td input[type="number"] {
   min-height: 360px;
 }
 
+.impact-history-trend-chart .chart-dot.day {
+  fill: #42784f;
+  stroke: #244a2e;
+}
+
+.impact-history-trend-chart .chart-dot.night {
+  fill: #a83224;
+  stroke: #6f2118;
+}
+
+.impact-turn-letter {
+  fill: #fff;
+  font-size: 7px;
+  font-weight: 900;
+  pointer-events: none;
+  text-anchor: middle;
+}
+
+.impact-history-axis {
+  padding: 0 4px;
+}
+
+.impact-history-trend-legend {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.impact-history-trend-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.impact-history-trend-legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
+.impact-history-trend-legend i.day {
+  background: #42784f;
+}
+
+.impact-history-trend-legend i.night {
+  background: #a83224;
+}
+
 .impact-dispatch-bars {
   display: grid;
   gap: 8px;

@@ -1,6 +1,7 @@
 const SPREADSHEET_ID = "1EBG_HWQ3lp4UWjPtpMgc0UMe_mH53RWtgAtnDMCQ_nc";
 const SHEET_NAME = "Incidencias";
 const IMPACT_SHEET_NAME = "Impacto_Turnos";
+const IMPACT_DETAIL_SHEET_NAME = "Impacto_Detalle_Historico";
 const HEADERS = [
   "tienda",
   "pallet",
@@ -34,6 +35,28 @@ const IMPACT_HEADERS = [
   "fecha_calculo",
   "id",
 ];
+const IMPACT_DETAIL_HEADERS = [
+  "fecha_corte",
+  "turno_corte",
+  "id_incidencia",
+  "estado_incidencia",
+  "fecha_incidente",
+  "pallet",
+  "lpn",
+  "codigo",
+  "producto",
+  "bultos",
+  "costo_neto",
+  "estado_envio",
+  "destino",
+  "nro_carga",
+  "placa",
+  "chofer",
+  "paletas_carga",
+  "fecha_envio",
+  "fecha_calculo",
+  "id",
+];
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -56,6 +79,9 @@ function doPost(e) {
     }
     if (payload.action === "saveImpact") {
       return jsonResponse({ ok: true, saved: guardarImpactoTurnos(payload.rows) });
+    }
+    if (payload.action === "saveImpactDetail") {
+      return jsonResponse({ ok: true, saved: guardarImpactoDetalle(payload.rows) });
     }
 
     const record = guardarIncidencia(payload);
@@ -83,6 +109,11 @@ function doGet(e) {
         ok: true,
         rows: listarImpactoTurnos(),
       };
+    } else if (action === "listImpactDetail") {
+      payload = {
+        ok: true,
+        rows: listarImpactoDetalle(),
+      };
     } else if (action === "create") {
       if (!lock.tryLock(5000)) throw new Error("Sistema ocupado, intenta nuevamente.");
       payload = {
@@ -99,6 +130,9 @@ function doGet(e) {
     } else if (action === "saveImpact") {
       if (!lock.tryLock(5000)) throw new Error("Sistema ocupado, intenta nuevamente.");
       payload = { ok: true, saved: guardarImpactoTurnos(e.parameter.rows) };
+    } else if (action === "saveImpactDetail") {
+      if (!lock.tryLock(5000)) throw new Error("Sistema ocupado, intenta nuevamente.");
+      payload = { ok: true, saved: guardarImpactoDetalle(e.parameter.rows) };
     } else if (action === "health" || action === "setup") {
       payload = estadoServicio();
     } else {
@@ -203,6 +237,25 @@ function listarImpactoTurnos() {
   }).reverse();
 }
 
+function listarImpactoDetalle() {
+  const sheet = getImpactDetailSheet();
+  const values = sheet.getDataRange().getValues();
+  if (values.length <= 1) return [];
+  const headers = values[0];
+  return values.slice(1).filter((row) => row.some((cell) => cell !== "")).map((row) => {
+    const record = {};
+    headers.forEach((header, index) => {
+      const value = row[index];
+      if (["bultos", "costo_neto", "paletas_carga"].indexOf(header) >= 0) {
+        record[header] = normalizarNumeroReporteConCero(value, header === "costo_neto" ? 2 : 2);
+      } else {
+        record[header] = value instanceof Date ? value.toLocaleString("es-PE") : value;
+      }
+    });
+    return record;
+  }).reverse();
+}
+
 function guardarImpactoTurnos(rowsInput) {
   const rows = normalizarImpactRows(rowsInput);
   if (!rows.length) throw new Error("No hay filas de impacto para guardar");
@@ -231,6 +284,35 @@ function guardarImpactoTurnos(rowsInput) {
   });
   formatImpactSheet(sheet);
   return saved;
+}
+
+function guardarImpactoDetalle(rowsInput) {
+  const rows = normalizarImpactRows(rowsInput);
+  if (!rows.length) return 0;
+  const sheet = getImpactDetailSheet();
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0];
+  const fechaIndex = headers.indexOf("fecha_corte");
+  const turnoIndex = headers.indexOf("turno_corte");
+  const cortes = {};
+  rows.forEach((payload) => {
+    const fecha = fechaImpactoKey(payload.fecha_corte || payload.fechaCorte || payload.fecha);
+    const turno = String(payload.turno_corte || payload.turnoCorte || payload.turno || "").trim();
+    if (fecha && turno) cortes[fecha + "|" + turno] = true;
+  });
+  for (let row = values.length - 1; row >= 1; row -= 1) {
+    const key = fechaImpactoKey(values[row][fechaIndex]) + "|" + String(values[row][turnoIndex] || "").trim();
+    if (cortes[key]) sheet.deleteRow(row + 1);
+  }
+  const normalized = rows.map((payload) => {
+    const record = normalizarImpactoDetalle(payload);
+    return IMPACT_DETAIL_HEADERS.map((header) => record[header] ?? "");
+  });
+  if (normalized.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, normalized.length, IMPACT_DETAIL_HEADERS.length).setValues(normalized);
+  }
+  formatImpactDetailSheet(sheet);
+  return normalized.length;
 }
 
 function actualizarEstado(id, estado) {
@@ -350,6 +432,31 @@ function normalizarImpactoTurno(payload) {
   };
 }
 
+function normalizarImpactoDetalle(payload) {
+  return {
+    fecha_corte: payload.fecha_corte || payload.fechaCorte || payload.fecha || "",
+    turno_corte: payload.turno_corte || payload.turnoCorte || payload.turno || "",
+    id_incidencia: payload.id_incidencia || payload.idIncidencia || "",
+    estado_incidencia: payload.estado_incidencia || payload.estadoIncidencia || payload.estado || "",
+    fecha_incidente: payload.fecha_incidente || payload.fechaIncidente || "",
+    pallet: payload.pallet || "",
+    lpn: payload.lpn || "",
+    codigo: payload.codigo || payload.codigos || "",
+    producto: payload.producto || payload.descripcion || "",
+    bultos: normalizarNumeroReporteConCero(payload.bultos ?? "", 2),
+    costo_neto: normalizarNumeroReporteConCero(payload.costo_neto ?? payload.costoNeto ?? payload.precio ?? "", 2),
+    estado_envio: payload.estado_envio || payload.estadoEnvio || "",
+    destino: payload.destino || payload.tienda || "",
+    nro_carga: payload.nro_carga || payload.nroCarga || payload.carga || "",
+    placa: payload.placa || "",
+    chofer: payload.chofer || "",
+    paletas_carga: normalizarNumeroReporteConCero(payload.paletas_carga ?? payload.paletasCarga ?? "", 2),
+    fecha_envio: payload.fecha_envio || payload.fechaEnvio || payload.fechaDespacho || "",
+    fecha_calculo: payload.fecha_calculo || payload.fechaCalculo || new Date(),
+    id: payload.id || Utilities.getUuid(),
+  };
+}
+
 function normalizarNumeroReporte(valor, decimales) {
   const numero = numeroDesdeValor(valor);
   if (!numero) return "";
@@ -394,6 +501,14 @@ function getImpactSheet() {
   let sheet = spreadsheet.getSheetByName(IMPACT_SHEET_NAME) || spreadsheet.insertSheet(IMPACT_SHEET_NAME);
   ensureImpactHeaders(sheet);
   formatImpactSheet(sheet);
+  return sheet;
+}
+
+function getImpactDetailSheet() {
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  let sheet = spreadsheet.getSheetByName(IMPACT_DETAIL_SHEET_NAME) || spreadsheet.insertSheet(IMPACT_DETAIL_SHEET_NAME);
+  ensureImpactDetailHeaders(sheet);
+  formatImpactDetailSheet(sheet);
   return sheet;
 }
 
@@ -504,6 +619,29 @@ function ensureImpactHeaders(sheet) {
   sheet.getRange(1, 1, migrated.length + 1, IMPACT_HEADERS.length).setValues([IMPACT_HEADERS].concat(migrated));
 }
 
+function ensureImpactDetailHeaders(sheet) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(IMPACT_DETAIL_HEADERS);
+    return;
+  }
+  const lastColumn = Math.max(sheet.getLastColumn(), IMPACT_DETAIL_HEADERS.length);
+  const existing = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const ok = IMPACT_DETAIL_HEADERS.every((header, index) => existing[index] === header);
+  if (ok) return;
+  const lastRow = sheet.getLastRow();
+  const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
+  const oldHeaders = values[0].map(String);
+  const migrated = values.slice(1).map((row) => {
+    const record = {};
+    oldHeaders.forEach((header, index) => {
+      if (header) record[header] = row[index];
+    });
+    if (!record.id) record.id = Utilities.getUuid();
+    return IMPACT_DETAIL_HEADERS.map((header) => record[header] ?? "");
+  });
+  sheet.getRange(1, 1, migrated.length + 1, IMPACT_DETAIL_HEADERS.length).setValues([IMPACT_DETAIL_HEADERS].concat(migrated));
+}
+
 function formatSheet(sheet) {
   sheet.showColumns(1, HEADERS.length);
   sheet.setFrozenRows(1);
@@ -539,6 +677,22 @@ function formatImpactSheet(sheet) {
   [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].forEach((column) => sheet.setColumnWidth(column, 150));
   sheet.setColumnWidth(IMPACT_HEADERS.length, 1);
   sheet.hideColumns(IMPACT_HEADERS.length);
+}
+
+function formatImpactDetailSheet(sheet) {
+  sheet.showColumns(1, IMPACT_DETAIL_HEADERS.length);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, IMPACT_DETAIL_HEADERS.length)
+    .setFontWeight("bold")
+    .setBackground("#e9f1ec")
+    .setFontColor("#17221b");
+  sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), 2).setNumberFormat("@");
+  sheet.getRange(2, 10, Math.max(sheet.getMaxRows() - 1, 1), 2).setNumberFormat("0.00");
+  [1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 18, 19].forEach((column) => sheet.setColumnWidth(column, 150));
+  sheet.setColumnWidth(9, 360);
+  sheet.setColumnWidth(17, 120);
+  sheet.setColumnWidth(IMPACT_DETAIL_HEADERS.length, 1);
+  sheet.hideColumns(IMPACT_DETAIL_HEADERS.length);
 }
 
 function jsonResponse(payload) {
