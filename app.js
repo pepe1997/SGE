@@ -1636,6 +1636,13 @@ function shortDateLabel(value) {
   return `${day}/${month}`;
 }
 
+function fullDateLabel(value) {
+  const key = historyDateKey(value);
+  if (!key) return normalize(value);
+  const [year, month, day] = key.split("-");
+  return `${day}/${month}/${year}`;
+}
+
 function rowOperationalDate(row) {
   return parseIncidentDate(row?._shipment?.fechaDespacho) || row?._date || null;
 }
@@ -2338,7 +2345,7 @@ function impactTrendByTurnForRange(fromValue, toValue, currentRows) {
     .slice(-16);
 }
 
-function renderLineChart(points, valueKey = "count", valueLabel = "incidencias") {
+function renderLineChart(points, valueKey = "count", valueLabel = "incidencias", options = {}) {
   if (!points.length) return `<div class="chart-empty">Sin data.</div>`;
   const width = 720;
   const height = 220;
@@ -2353,6 +2360,9 @@ function renderLineChart(points, valueKey = "count", valueLabel = "incidencias")
   });
   const path = coords.map((point, index) => `${index ? "L" : "M"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
   const area = `${path} L ${coords[coords.length - 1].x.toFixed(1)} ${height - pad} L ${coords[0].x.toFixed(1)} ${height - pad} Z`;
+  const axisLabels = options.axis === "range"
+    ? (options.axisLabels || [coords[0]?.key, coords[coords.length - 1]?.key]).filter(Boolean)
+    : coords.slice(-5).map((point) => point.key);
   return `
     <svg class="line-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Tendencia por fecha">
       <path class="chart-grid" d="M ${pad} ${height - pad} H ${width - pad} M ${pad} ${pad} H ${width - pad}" />
@@ -2365,7 +2375,7 @@ function renderLineChart(points, valueKey = "count", valueLabel = "incidencias")
         </g>
       `).join("")}
     </svg>
-    <div class="chart-axis">${coords.slice(-5).map((point) => `<span>${escapeHtml(point.key)}</span>`).join("")}</div>
+    <div class="chart-axis ${options.axis === "range" ? "range-axis" : ""}">${axisLabels.map((label) => `<span>${escapeHtml(label)}</span>`).join("")}</div>
   `;
 }
 
@@ -2589,6 +2599,13 @@ function impactDetailNaturalKey(row) {
 function sentIncidentRows() {
   const sentMap = sentPalletMap();
   const cargos = cargoMap();
+  const liveShipmentMatches = (pallet) => (sentMap.get(palletKey(pallet)) || []).map((shipment) => enrichShipmentWithCargo(shipment, cargos));
+  const applyLiveSentMatch = (row, matches) => matches.length ? {
+    ...row,
+    _sent: true,
+    _shipment: matches[0],
+    _shipments: matches,
+  } : row;
   const detailByIncident = new Map();
   const detailByNaturalKey = new Map();
   state.impactDetailHistory.forEach((row) => {
@@ -2602,6 +2619,7 @@ function sentIncidentRows() {
   });
   const usedDetails = new Set();
   const rows = allDashboardRows().map((row) => {
+    const matches = liveShipmentMatches(row.pallet);
     const savedDetail = detailByIncident.get(String(row.id || "")) || detailByNaturalKey.get(impactDetailNaturalKey({
       fecha_corte: dateInputValue(row._date),
       fecha_incidente: row.fecha_incidente,
@@ -2610,9 +2628,8 @@ function sentIncidentRows() {
     }));
     if (savedDetail) {
       usedDetails.add(savedDetail.id || savedDetail.id_incidencia || impactDetailNaturalKey(savedDetail));
-      return impactDetailToIncidentRow(savedDetail, row);
+      return applyLiveSentMatch(impactDetailToIncidentRow(savedDetail, row), matches);
     }
-    const matches = (sentMap.get(palletKey(row.pallet)) || []).map((shipment) => enrichShipmentWithCargo(shipment, cargos));
     return {
       ...row,
       _sent: matches.length > 0,
@@ -2623,7 +2640,8 @@ function sentIncidentRows() {
   state.impactDetailHistory.forEach((detail) => {
     const key = detail.id || detail.id_incidencia || impactDetailNaturalKey(detail);
     if (!key || usedDetails.has(key)) return;
-    rows.push(impactDetailToIncidentRow(detail));
+    const detailRow = impactDetailToIncidentRow(detail);
+    rows.push(applyLiveSentMatch(detailRow, liveShipmentMatches(detailRow.pallet)));
   });
   return rows;
 }
@@ -3704,7 +3722,15 @@ function renderDashboard() {
               <button class="${state.dashboardTrend === "dates" ? "active" : ""}" data-dashboard-trend="dates">Fechas</button>
             </div>
           </div>
-          ${renderLineChart(tendencia, "count", "incidencias")}
+          ${renderLineChart(tendencia, "count", "incidencias", {
+            axis: state.dashboardTrend === "dates" ? "range" : "default",
+            axisLabels: state.dashboardTrend === "dates"
+              ? [
+                  fullDateLabel(state.summaryDateFrom || tendencia[0]?.key),
+                  fullDateLabel(state.summaryDateTo || tendencia[tendencia.length - 1]?.key),
+                ].filter(Boolean)
+              : null,
+          })}
         </article>
         <article class="chart-card">
           <div class="chart-title"><h3>Bultos por turno</h3><span>Dia · Tarde · Noche</span></div>

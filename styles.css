@@ -1845,6 +1845,11 @@ td input[type="number"] {
   font-weight: 800;
 }
 
+.chart-axis.range-axis span:last-child {
+  margin-left: auto;
+  text-align: right;
+}
+
 .advance-report {
   display: grid;
   gap: 14px;
